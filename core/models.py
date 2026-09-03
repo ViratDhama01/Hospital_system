@@ -1,0 +1,42 @@
+from dataclasses import dataclass, field
+from datetime import datetime, time
+from typing import Optional
+
+@dataclass
+class Patient:
+    patient_id: Optional[int]
+    name: str
+    dob: str  # Simplified as string for now
+    gender: str
+    phone: str
+    address: str
+    blood_group: str
+    created_at: datetime = field(default_factory=datetime.now)
+
+    def __str__(self):
+        return f"Patient[{self.patient_id}]: {self.name} ({self.phone})"
+
+@dataclass
+class Doctor:
+    doctor_id: Optional[int]
+    name: str
+    department: str
+    specialization: str
+    available_from: time
+    available_to: time
+
+    def __str__(self):
+        return f"Doctor[{self.doctor_id}]: Dr. {self.name} - {self.department} ({self.specialization})"
+
+@dataclass
+class Appointment:
+    appointment_id: Optional[int]
+    patient: Patient
+    doctor: Doctor
+    start_time: datetime
+    end_time: datetime
+    status: str = "booked"  # booked/completed/cancelled/no-show
+    priority: int = 0        # Higher number = higher priority (for emergency/triage)
+
+    def __str__(self):
+        return f"Appointment[{self.appointment_id}]: {self.patient.name} with Dr. {self.doctor.name} from {self.start_time.strftime('%H:%M')} to {self.end_time.strftime('%H:%M')} (Priority: {self.priority})"
