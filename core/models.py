@@ -11,6 +11,8 @@ class Patient:
     phone: str
     address: str
     blood_group: str
+    is_cured: int = 0
+    cured_at: Optional[datetime] = None
     created_at: datetime = field(default_factory=datetime.now)
 
     def __str__(self):
@@ -24,6 +26,9 @@ class Doctor:
     specialization: str
     available_from: time
     available_to: time
+    employment_status: str = "active"
+    status_reason: Optional[str] = None
+    status_updated_at: Optional[datetime] = None
 
     def __str__(self):
         return f"Doctor[{self.doctor_id}]: Dr. {self.name} - {self.department} ({self.specialization})"
@@ -36,7 +41,9 @@ class Appointment:
     start_time: datetime
     end_time: datetime
     status: str = "booked"  # booked/completed/cancelled/no-show
-    priority: int = 0        # Higher number = higher priority (for emergency/triage)
+    priority: int = 0
+    category: str = "routine"
+    completed_at: Optional[datetime] = None
 
     def __str__(self):
         return f"Appointment[{self.appointment_id}]: {self.patient.name} with Dr. {self.doctor.name} from {self.start_time.strftime('%H:%M')} to {self.end_time.strftime('%H:%M')} (Priority: {self.priority})"

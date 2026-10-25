@@ -1,6 +1,17 @@
-from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Optional, List
+from pydantic import BaseModel, Field, model_validator
+from typing import Optional, List, Any, Literal
 from datetime import datetime, time
+
+# --- Auth Schemas ---
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class ProfileUpdate(BaseModel):
+    username: str = Field(..., min_length=3, max_length=64)
+    display_name: str = Field(..., min_length=1, max_length=120)
+    current_password: Optional[str] = None
+    new_password: Optional[str] = Field(default=None, min_length=8, max_length=128)
 
 # --- Patient Schemas ---
 class PatientCreate(BaseModel):
@@ -19,6 +30,9 @@ class PatientUpdate(BaseModel):
     address: Optional[str] = None
     blood_group: Optional[str] = None
 
+class PatientCureUpdate(BaseModel):
+    cured: bool
+
 class PatientRead(BaseModel):
     patient_id: int
     name: str
@@ -27,7 +41,9 @@ class PatientRead(BaseModel):
     phone: str
     address: str
     blood_group: str
-    created_at: Optional[str] = None
+    is_cured: bool = False
+    cured_at: Optional[Any] = None
+    created_at: Optional[Any] = None # Changed to Any to avoid validation crashes with datetime objects
 
 # --- Doctor Schemas ---
 class DoctorCreate(BaseModel):
@@ -39,8 +55,11 @@ class DoctorCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_shift(self):
-        if time.fromisoformat(self.available_from) >= time.fromisoformat(self.available_to):
-            raise ValueError("available_to must be later than available_from")
+        try:
+            if time.fromisoformat(self.available_from) >= time.fromisoformat(self.available_to):
+                raise ValueError("available_to must be later than available_from")
+        except ValueError:
+            raise ValueError("Invalid time format. Please use HH:MM")
         return self
 
 class DoctorRead(BaseModel):
@@ -50,6 +69,12 @@ class DoctorRead(BaseModel):
     specialization: str
     available_from: str
     available_to: str
+    employment_status: str = "active"
+    status_reason: Optional[str] = None
+    status_updated_at: Optional[Any] = None
+
+class DoctorStatusUpdate(BaseModel):
+    employment_status: Literal["active", "suspended", "resigned", "duplicate"]
 
 # --- Appointment Schemas ---
 class AppointmentCreate(BaseModel):
@@ -57,15 +82,23 @@ class AppointmentCreate(BaseModel):
     doctor_id: int
     start_time: datetime
     duration_minutes: int = Field(default=30, ge=5, le=120)
+    category: Literal["routine", "emergency"] = "routine"
+    timezone_offset_minutes: int = Field(default=0, ge=-840, le=840)
+
+class AppointmentCompleteRequest(BaseModel):
+    completed_at: Optional[datetime] = None
 
 class AppointmentRead(BaseModel):
     appointment_id: int
     patient_id: int
     doctor_id: int
-    start_time: datetime
-    end_time: datetime
+    start_time: Any # Changed to Any to prevent datetime serialization crashes
+    end_time: Any # Changed to Any to prevent datetime serialization crashes
     status: str
     priority: int
+    category: str = "routine"
+    completed_at: Optional[Any] = None
+    rescheduled_for_emergency: bool = False
 
 # --- Queue Schemas ---
 class QueueAdd(BaseModel):
@@ -75,6 +108,7 @@ class QueueAdd(BaseModel):
 class QueuePatient(BaseModel):
     priority: int
     patient: PatientRead
+    assigned_doctor: Optional[DoctorRead] = None
 
 # --- Report Schemas ---
 class FinancialSummary(BaseModel):
@@ -89,3 +123,63 @@ class DoctorLoad(BaseModel):
 class DeptFootfall(BaseModel):
     department: str
     total_visits: int
+
+class BillGenerateRequest(BaseModel):
+    appointment_id: int = Field(..., gt=0)
+
+class BillPaymentRequest(BaseModel):
+    bill_id: int = Field(..., gt=0)
+    amount: float = Field(..., gt=0)
+    method: Literal["Credit Card", "Debit Card", "UPI", "Cash"] = "Credit Card"
+
+class BillStatusUpdate(BaseModel):
+    payment_status: Literal["paid", "unpaid"]
+
+# --- Clinical Schemas ---
+class HealthRecordCreate(BaseModel):
+    patient_id: int
+    doctor_id: int
+    note: str
+    category: Optional[str] = "Consultation"
+
+class HealthRecordRead(BaseModel):
+    record_id: int
+    patient_id: int
+    doctor_id: int
+    note: str
+    category: str
+    created_at: Any # Changed to Any to prevent datetime serialization crashes
+
+class PrescriptionCreate(BaseModel):
+    patient_id: int
+    doctor_id: int
+    medication: str
+    dosage: str
+    frequency: str
+    duration: str
+
+class PrescriptionRead(BaseModel):
+    prescription_id: int
+    patient_id: int
+    doctor_id: int
+    medication: str
+    dosage: str
+    frequency: str
+    duration: str
+    date_issued: Any # Changed to Any to prevent datetime serialization crashes
+
+class LabResultCreate(BaseModel):
+    patient_id: int
+    test_name: str
+    result_value: str
+    unit: Optional[str] = None
+    status: Optional[str] = "final"
+
+class LabResultRead(BaseModel):
+    lab_id: int
+    patient_id: int
+    test_name: str
+    result_value: str
+    unit: Optional[str]
+    status: str
+    date_performed: Any # Changed to Any to prevent datetime serialization crashes

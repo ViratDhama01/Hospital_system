@@ -1,6 +1,8 @@
-from typing import Dict
+from typing import Dict, Tuple
 from .models import Patient, Doctor, Appointment
 from db.database import db
+from .insurance import insurance_manager
+from .payments import payment_manager
 
 class BillingSystem:
     def __init__(self):
@@ -16,9 +18,17 @@ class BillingSystem:
 
     def _init_billing_table(self):
         """Creates a simple bills table if it doesn't exist."""
-        query = """
+        from db.database import db
+
+        # PostgreSQL doesn't use AUTOINCREMENT. We use SERIAL or just omit it for PRIMARY KEY.
+        if db.engine == "postgres":
+            pk_syntax = "SERIAL PRIMARY KEY"
+        else:
+            pk_syntax = "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+        query = f"""
             CREATE TABLE IF NOT EXISTS bills (
-                bill_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bill_id {pk_syntax},
                 appointment_id INTEGER NOT NULL,
                 amount REAL NOT NULL,
                 payment_status TEXT DEFAULT 'unpaid',
@@ -28,17 +38,55 @@ class BillingSystem:
         """
         db.execute(query)
 
-    def generate_bill(self, appointment: Appointment) -> float:
+    def generate_bill(self, appointment: Appointment) -> Tuple[float, float]:
         """
-        Calculates and records a bill for an appointment based on the doctor's department.
+        Calculates and records a bill for an appointment.
+        Returns (total_amount, patient_share).
         """
-        fee = self.dept_fees.get(appointment.doctor.department, 200) # Default 200 if dept not found
+        total_fee = self.dept_fees.get(appointment.doctor.department, 200)
+
+        # Check for insurance
+        patient_share = total_fee
+        insurance_share = 0.0
+
+        policy = insurance_manager.get_policy(appointment.patient.patient_id)
+        if policy:
+            insurance_share = insurance_manager.verify_coverage(policy.policy_id, total_fee)
+            patient_share = total_fee - insurance_share
 
         query = "INSERT INTO bills (appointment_id, amount) VALUES (?, ?)"
-        cursor = db.execute(query, (appointment.appointment_id, fee))
+        cursor = db.execute(query, (appointment.appointment_id, total_fee))
 
-        print(f"Bill generated for {appointment.patient.name}: ₹{fee}")
-        return fee
+        print(f"Bill generated for {appointment.patient.name}: Total ₹{total_fee}, Patient Share ₹{patient_share}, Insurance ₹{insurance_share}")
+        return total_fee, patient_share
+
+    def process_patient_payment(self, bill_id: int, amount: float, method: str):
+        """Processes a payment and updates bill status if fully paid."""
+        payment = payment_manager.process_payment(bill_id, amount, method)
+        if not payment:
+            return False
+
+        if payment.status == "processing":
+            db.execute("UPDATE bills SET payment_status = 'processing' WHERE bill_id = ?", (bill_id,))
+            return True
+
+        # Check if bill is now fully paid
+        row = db.query_one("SELECT amount FROM bills WHERE bill_id = ?", (bill_id,))
+        total_due = row['amount']
+
+        # Sum all payments for this bill
+        payments_rows = db.query(
+            "SELECT amount FROM payments WHERE bill_id = ? AND status = 'completed'",
+            (bill_id,),
+        )
+        total_paid = sum(p['amount'] for p in payments_rows)
+
+        if total_paid >= total_due:
+            self.mark_paid(bill_id)
+        else:
+            db.execute("UPDATE bills SET payment_status = 'unpaid' WHERE bill_id = ?", (bill_id,))
+
+        return True
 
     def mark_paid(self, bill_id: int):
         """Marks a bill as paid."""

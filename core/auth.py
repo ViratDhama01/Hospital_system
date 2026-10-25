@@ -4,8 +4,10 @@ from jose import JWTError, jwt
 import bcrypt
 from db.database import db
 
+import os
+
 # Configuration
-SECRET_KEY = "super-secret-hospital-key"
+SECRET_KEY = os.environ.get("HOSPITAL_SECRET_KEY", "dev-secret-key-do-not-use-in-prod")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
 
@@ -36,10 +38,10 @@ class AuthManager:
         except JWTError:
             return None
 
-    def create_user(self, username, password, role="receptionist"):
+    def create_user(self, username, password, role="receptionist", display_name=None):
         hashed_pw = self.get_password_hash(password)
-        query = "INSERT INTO users (username, hashed_password, role) VALUES (?, ?, ?)"
-        cursor = db.execute(query, (username, hashed_pw, role))
+        query = "INSERT INTO users (username, hashed_password, role, display_name) VALUES (?, ?, ?, ?)"
+        cursor = db.execute(query, (username, hashed_pw, role, display_name or username))
         return cursor.lastrowid
 
     def authenticate_user(self, username, password):
@@ -51,7 +53,8 @@ class AuthManager:
             return {
                 "user_id": row['user_id'],
                 "username": row['username'],
-                "role": row['role']
+                "role": row['role'],
+                "display_name": row['display_name']
             }
         return None
 
