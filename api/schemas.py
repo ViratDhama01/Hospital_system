@@ -56,8 +56,8 @@ class DoctorCreate(BaseModel):
     @model_validator(mode="after")
     def validate_shift(self):
         try:
-            if time.fromisoformat(self.available_from) >= time.fromisoformat(self.available_to):
-                raise ValueError("available_to must be later than available_from")
+            time.fromisoformat(self.available_from)
+            time.fromisoformat(self.available_to)
         except ValueError:
             raise ValueError("Invalid time format. Please use HH:MM")
         return self

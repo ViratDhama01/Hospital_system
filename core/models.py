@@ -47,3 +47,19 @@ class Appointment:
 
     def __str__(self):
         return f"Appointment[{self.appointment_id}]: {self.patient.name} with Dr. {self.doctor.name} from {self.start_time.strftime('%H:%M')} to {self.end_time.strftime('%H:%M')} (Priority: {self.priority})"
+
+class SchedulingError(Exception):
+    """Base exception for scheduling errors."""
+    pass
+
+class SlotOutsideAvailabilityError(SchedulingError):
+    """Raised when a requested slot is outside the doctor's shift."""
+    pass
+
+class SlotOverlapError(SchedulingError):
+    """Raised when a requested slot overlaps an existing appointment."""
+    pass
+
+class PastAppointmentError(SchedulingError):
+    """Raised when attempting to book a routine appointment in the past."""
+    pass

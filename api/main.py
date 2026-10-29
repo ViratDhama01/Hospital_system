@@ -8,6 +8,7 @@ from typing import List, Optional
 from datetime import datetime, time
 from pathlib import Path
 
+from core.models import SchedulingError, SlotOutsideAvailabilityError, SlotOverlapError, PastAppointmentError
 from core.patient_registry import PatientRegistry
 from core.doctor_manager import DoctorManager
 from core.scheduler import Scheduler
@@ -582,13 +583,11 @@ def book_appointment(apt_req: AppointmentCreate, user: dict = Depends(require_au
 
     try:
         from datetime import timedelta, timezone
-        clinic_now = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=apt_req.timezone_offset_minutes)
+        clinic_now = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=apt_req.timezone_offset_minutes)
         apt = scheduler.book_appointment(
             patient, doctor, apt_req.start_time, apt_req.duration_minutes,
             apt_req.category, clinic_now,
         )
-        if not apt:
-            raise HTTPException(status_code=400, detail="Doctor unavailable at that time or slot overlaps an existing appointment")
 
         res = {
             "appointment_id": apt.appointment_id,
@@ -603,6 +602,12 @@ def book_appointment(apt_req: AppointmentCreate, user: dict = Depends(require_au
             "rescheduled_for_emergency": apt_req.category == "emergency" and apt.start_time != apt_req.start_time.replace(tzinfo=None),
         }
         return res
+    except SlotOutsideAvailabilityError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except SlotOverlapError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except PastAppointmentError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
@@ -811,7 +816,7 @@ def get_dashboard_summary(timezone_offset_minutes: int = 0, user: dict = Depends
             return value
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=timezone_offset_minutes)
+    now = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=timezone_offset_minutes)
     today = now.date()
     appointments = db.query(
         "SELECT a.appointment_id, a.patient_id, a.doctor_id, a.start_time, a.end_time, "
