@@ -1,10 +1,11 @@
 import asyncio
 import json
-from fastapi import FastAPI, HTTPException, Depends, Request, Response, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse, JSONResponse
+import os
+import sqlite3
+from fastapi import FastAPI, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
+from psycopg2.errors import UniqueViolation
+from typing import List, Literal, Optional
 from datetime import datetime, time
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from core.doctor_manager import DoctorManager
 from core.scheduler import Scheduler
 from core.queue_manager import QueueManager
 from core.billing import BillingSystem
+from core.payments import payment_manager
 from core.reporting import ReportingSystem
 from core.auth import auth_manager
 from core.ehr import ehr_manager
@@ -24,10 +26,12 @@ from api.websocket import queue_notifier
 from api.schemas import (
     LoginRequest,
     ProfileUpdate,
-    PatientCreate, PatientRead, PatientUpdate, PatientCureUpdate,
+    StaffAccessUpdate, StaffCreate,
+    PatientCreate, PatientRead, PatientUpdate, PatientCureUpdate, PatientArchiveUpdate,
     DoctorCreate, DoctorRead, DoctorStatusUpdate,
     AppointmentCreate, AppointmentRead,
     AppointmentCompleteRequest,
+    AppointmentStaffUpdate,
     QueueAdd, QueuePatient,
     FinancialSummary, DoctorLoad, DeptFootfall, BillGenerateRequest,
     BillPaymentRequest, BillStatusUpdate,
@@ -38,27 +42,18 @@ from api.schemas import (
 
 app = FastAPI(title="Hospital Registration System API")
 
-# --- CORS Configuration ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if os.environ.get("MEDORA_DESKTOP") != "1":
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://127.0.0.1:3000", "http://localhost:3000"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 @app.get("/ping")
 async def ping():
     return {"status": "ok", "message": "Backend is alive and responding!"}
-
-# --- CORS Configuration ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -89,20 +84,34 @@ def get_current_user(request: Request):
         return None
 
     # Remove 'Bearer ' prefix
-    if token.startswith("Bearer "):
-        token = token.split(" ")[1]
-
-    payload = auth_manager.decode_access_token(token)
-    return payload if payload else None
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return auth_manager.decode_access_token(token) if token else None
 
 def require_auth(request: Request):
     user = get_current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="Authentication required")
+    if user["role"] not in {"admin", "doctor", "nurse", "receptionist"}:
+        raise HTTPException(status_code=403, detail="No supported role is assigned to this account")
     return user
 
+def allow_roles(*roles):
+    def check(user: dict = Depends(require_auth)):
+        if user["role"] not in roles:
+            raise HTTPException(status_code=403, detail="Your role does not have access to this action")
+        return user
+    return check
+
+
+admin_user = allow_roles("admin")
+clinical_user = allow_roles("admin", "doctor")
+operations_user = allow_roles("admin", "doctor", "receptionist")
+staff_user = allow_roles("admin", "doctor", "receptionist", "nurse")
+
+
 @app.get("/search", tags=["Search"])
-def global_search(q: str, user: dict = Depends(require_auth)):
+def global_search(q: str, user: dict = Depends(operations_user)):
     """Search active patients and doctors for the global navigation bar."""
     term = q.strip()
     if len(term) < 2:
@@ -112,7 +121,7 @@ def global_search(q: str, user: dict = Depends(require_auth)):
     pattern = f"%{term}%"
     patients = db.query(
         "SELECT patient_id, name, phone FROM patients "
-        "WHERE is_cured = 0 AND (LOWER(name) LIKE LOWER(?) OR phone LIKE ? "
+        "WHERE is_cured = 0 AND archived_at IS NULL AND (LOWER(name) LIKE LOWER(?) OR phone LIKE ? "
         "OR CAST(patient_id AS TEXT) LIKE ?) "
         "ORDER BY name LIMIT 6",
         (pattern, pattern, pattern),
@@ -131,7 +140,7 @@ def global_search(q: str, user: dict = Depends(require_auth)):
         # Exact ID lookups go through the managers' hash maps and take priority
         # over partial text matches from the database.
         patient = registry.get_by_id(int(term))
-        if patient and not patient.is_cured:
+        if patient and not patient.is_cured and not patient.archived_at:
             exact_patient = {"patient_id": patient.patient_id, "name": patient.name, "phone": patient.phone}
             patient_rows = [exact_patient] + [row for row in patient_rows if row["patient_id"] != patient.patient_id]
         doctor = doc_manager.get_by_id(int(term))
@@ -152,51 +161,111 @@ def global_search(q: str, user: dict = Depends(require_auth)):
 @app.on_event("startup")
 def startup_event():
     from db.database import db
-    user = db.query_one("SELECT * FROM users WHERE username = 'admin'")
+    user = db.query_one("SELECT * FROM users WHERE role = 'admin' ORDER BY user_id LIMIT 1")
     if not user:
         auth_manager.create_user("admin", "admin123", role="admin")
-        print("Default admin user created: admin / admin123")
     elif not user['hashed_password']:
         hashed_pw = auth_manager.get_password_hash("admin123")
-        db.execute("UPDATE users SET hashed_password = ? WHERE username = 'admin'", (hashed_pw,))
-        print("Default admin password reset: admin / admin123")
+        db.execute("UPDATE users SET hashed_password = ? WHERE user_id = ?", (hashed_pw, user["user_id"]))
 
-@app.post("/signup", tags=["Auth"])
-async def signup(user_data: dict, request: Request):
-    username = user_data.get("username")
-    password = user_data.get("password")
-    role = user_data.get("role", "receptionist")
-
-    if not username or not password:
-        raise HTTPException(status_code=400, detail="Username and password are required")
-
-    # Check if user already exists
-    existing = auth_manager.authenticate_user(username, "dummy_password") # This is a bit hacky, should have a dedicated check
-    # Better: use db.query_one
+@app.get("/staff", tags=["Auth"])
+def list_staff(user: dict = Depends(admin_user)):
     from db.database import db
-    if db.query_one("SELECT * FROM users WHERE username = ?", (username,)):
-        raise HTTPException(status_code=400, detail="Username already taken")
+    return db.query(
+        "SELECT u.user_id, u.username, u.display_name, u.role, u.doctor_id, d.name AS doctor_name "
+        "FROM users u LEFT JOIN doctors d ON d.doctor_id = u.doctor_id ORDER BY u.display_name, u.user_id"
+    )
 
-    user_id = auth_manager.create_user(username, password, role, user_data.get("display_name"))
+
+def validate_staff_doctor(db, doctor_id):
+    if doctor_id is None:
+        return
+    lock = " FOR SHARE" if db.engine == "postgres" else ""
+    if not db.query_one(
+        "SELECT doctor_id FROM doctors WHERE doctor_id = ? AND employment_status = 'active'" + lock,
+        (doctor_id,),
+    ):
+        raise HTTPException(status_code=400, detail="Select an active doctor")
+
+
+def record_staff_assignment(db, user_id, changed_by, detail, appointment_id=None):
+    db.execute(
+        "INSERT INTO staff_assignment_events (appointment_id, user_id, changed_by, detail) VALUES (?, ?, ?, ?)",
+        (appointment_id, user_id, changed_by, detail),
+    )
+
+
+@app.post("/signup", tags=["Auth"], status_code=201)
+def signup(account: StaffCreate, user: dict = Depends(admin_user)):
+    from db.database import db
+    username = account.username.lower()
+    display_name = account.display_name.strip()
+    if not display_name:
+        raise HTTPException(status_code=400, detail="Display name is required")
+    try:
+        with db.write_transaction():
+            if db.query_one("SELECT user_id FROM users WHERE LOWER(username) = ?", (username,)):
+                raise HTTPException(status_code=409, detail="Username already taken")
+            validate_staff_doctor(db, account.doctor_id)
+            user_id = auth_manager.create_user(username, account.password, account.role, display_name, account.doctor_id)
+            record_staff_assignment(db, user_id, user["user_id"], f"Created {account.role} account")
+    except (UniqueViolation, sqlite3.IntegrityError):
+        raise HTTPException(status_code=409, detail="This username or doctor already has an account")
     return {"message": "User created successfully", "user_id": user_id}
 
+
+@app.patch("/staff/{staff_id}/assignment", tags=["Auth"])
+def update_staff_assignment(staff_id: int, update: StaffAccessUpdate, user: dict = Depends(admin_user)):
+    from db.database import db
+
+    lock = " FOR UPDATE" if db.engine == "postgres" else ""
+    try:
+        with db.write_transaction():
+            account = db.query_one("SELECT role, doctor_id FROM users WHERE user_id = ?" + lock, (staff_id,))
+            if not account:
+                raise HTTPException(status_code=404, detail="Staff account not found")
+            if account["role"] == "admin":
+                raise HTTPException(status_code=403, detail="Administrator assignments cannot be edited here")
+            if (account["role"], account["doctor_id"]) == (update.role, update.doctor_id):
+                return {"user_id": staff_id, "role": update.role, "doctor_id": update.doctor_id}
+            validate_staff_doctor(db, update.doctor_id)
+            db.execute("UPDATE users SET role = ?, doctor_id = ? WHERE user_id = ?", (update.role, update.doctor_id, staff_id))
+            db.execute("DELETE FROM auth_sessions WHERE user_id = ?", (staff_id,))
+            removed = db.query(
+                "DELETE FROM appointment_staff_assignments WHERE user_id = ? AND role <> ? "
+                "AND appointment_id IN (SELECT appointment_id FROM appointments WHERE status = 'booked') "
+                "RETURNING appointment_id, role",
+                (staff_id, update.role),
+            )
+            for assignment in removed:
+                record_staff_assignment(db, staff_id, user["user_id"], f"Removed {assignment['role']} after role change", assignment["appointment_id"])
+            detail = f"Changed role from {account['role']} to {update.role}" if account["role"] != update.role else "Changed linked doctor profile"
+            if update.doctor_id:
+                detail += f" · Doctor #{update.doctor_id}"
+            record_staff_assignment(db, staff_id, user["user_id"], detail)
+    except (UniqueViolation, sqlite3.IntegrityError):
+        raise HTTPException(status_code=409, detail="This doctor already has an account")
+    return {"user_id": staff_id, "role": update.role, "doctor_id": update.doctor_id}
+
+
+@app.get("/staff/assignment-history", tags=["Auth"])
+def list_staff_assignment_history(user: dict = Depends(admin_user)):
+    from db.database import db
+
+    return db.query(
+        "SELECT e.event_id, e.appointment_id, e.detail, e.created_at, "
+        "staff.display_name AS staff_name, actor.display_name AS actor_name "
+        "FROM staff_assignment_events e JOIN users staff ON staff.user_id = e.user_id "
+        "JOIN users actor ON actor.user_id = e.changed_by ORDER BY e.created_at DESC, e.event_id DESC LIMIT 50"
+    )
+
 @app.get("/auth/status", tags=["Auth"])
-async def get_auth_status(request: Request):
-    user = get_current_user(request)
-    if not user:
-        return JSONResponse(status_code=401, content={"message": "Not authenticated"})
-    return {"user": user}
+def get_auth_status(user: dict = Depends(require_auth)):
+    return {"user": get_profile(user)}
 
 @app.get("/auth/profile", tags=["Auth"])
 def get_profile(user: dict = Depends(require_auth)):
-    from db.database import db
-    profile = db.query_one(
-        "SELECT user_id, username, display_name, role FROM users WHERE user_id = ?",
-        (user.get("user_id"),),
-    )
-    if not profile:
-        raise HTTPException(status_code=404, detail="Account not found")
-    return dict(profile)
+    return {key: value for key, value in user.items() if key != "session_id"}
 
 @app.put("/auth/profile", tags=["Auth"])
 def update_profile(update: ProfileUpdate, user: dict = Depends(require_auth)):
@@ -219,27 +288,29 @@ def update_profile(update: ProfileUpdate, user: dict = Depends(require_auth)):
 
     password_hash = account["hashed_password"]
     if update.new_password:
+        if len(update.new_password.encode("utf-8")) > 72:
+            raise HTTPException(status_code=400, detail="Password is too long when encoded as UTF-8")
         if not update.current_password or not auth_manager.verify_password(update.current_password, password_hash):
             raise HTTPException(status_code=400, detail="Current password is incorrect")
         password_hash = auth_manager.get_password_hash(update.new_password)
 
-    db.execute(
-        "UPDATE users SET username = ?, display_name = ?, hashed_password = ? WHERE user_id = ?",
-        (username, display_name, password_hash, account["user_id"]),
-    )
-    updated_profile = {
-        "user_id": account["user_id"],
-        "username": username,
-        "display_name": display_name,
-        "role": account["role"],
-    }
-    return {
-        **updated_profile,
-        "access_token": auth_manager.create_access_token(updated_profile),
-    }
+    updated_profile = {**get_profile(user), "username": username, "display_name": display_name}
+    try:
+        with db.write_transaction():
+            db.execute(
+                "UPDATE users SET username = ?, display_name = ?, hashed_password = ? WHERE user_id = ?",
+                (username, display_name, password_hash, account["user_id"]),
+            )
+            if update.new_password:
+                db.execute("DELETE FROM auth_sessions WHERE user_id = ?", (account["user_id"],))
+            else:
+                auth_manager.revoke_session(user["session_id"])
+            return {**updated_profile, "access_token": auth_manager.create_access_token(updated_profile)}
+    except (UniqueViolation, sqlite3.IntegrityError):
+        raise HTTPException(status_code=409, detail="That username is already in use")
 
 @app.post("/login", tags=["Auth"])
-async def login(login_data: LoginRequest):
+def login(login_data: LoginRequest):
     username = login_data.username
     password = login_data.password
 
@@ -250,17 +321,17 @@ async def login(login_data: LoginRequest):
     token = auth_manager.create_access_token(user)
     return {"message": "Login successful", "access_token": token, "user": user}
 
-@app.get("/logout")
-async def logout(request: Request):
-    # Build a redirect AND delete the cookie on the same response object
-    response = RedirectResponse(url="/", status_code=303)
-    response.delete_cookie("access_token")
-    return response
+@app.post("/logout", tags=["Auth"])
+def logout(user: dict = Depends(require_auth)):
+    auth_manager.revoke_session(user["session_id"])
+    return {"message": "Signed out"}
 
 # --- Patient Routes ---
 
 @app.get("/patients/", response_model=List[PatientRead], tags=["Patients"])
-def list_patients(status: str = "active", user: dict = Depends(require_auth)):
+def list_patients(status: Literal["active", "cured", "all", "archived"] = "active", user: dict = Depends(operations_user)):
+    if status == "archived" and user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only administrators can access the archived registry")
     try:
         patients = registry.list_all_patients(status)
         # Explicitly convert datetime objects to strings to avoid Pydantic validation crashes
@@ -279,7 +350,7 @@ def list_patients(status: str = "active", user: dict = Depends(require_auth)):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/patients/", response_model=PatientRead, tags=["Patients"])
-def register_patient(patient: PatientCreate, user: dict = Depends(require_auth)):
+def register_patient(patient: PatientCreate, user: dict = Depends(operations_user)):
     if registry.get_by_phone(patient.phone):
         raise HTTPException(status_code=409, detail="A patient with this phone number already exists")
     try:
@@ -298,18 +369,38 @@ def register_patient(patient: PatientCreate, user: dict = Depends(require_auth))
         print(f"Error in register_patient: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+@app.get("/patients/directory", tags=["Patients"])
+def patient_directory(active_only: bool = False, user: dict = Depends(staff_user)):
+    from db.database import db
+    active_filter = " AND is_cured = 0" if active_only else ""
+    return db.query(
+        f"SELECT patient_id, name FROM patients WHERE archived_at IS NULL{active_filter} ORDER BY name, patient_id"
+    )
+
+
+@app.get("/patients/directory/{patient_id}", tags=["Patients"])
+def patient_directory_entry(patient_id: int, user: dict = Depends(staff_user)):
+    from db.database import db
+    patient = db.query_one(
+        "SELECT patient_id, name FROM patients WHERE patient_id = ? AND archived_at IS NULL", (patient_id,),
+    )
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    return patient
+
+
 @app.get("/patients/{patient_id}", response_model=PatientRead, tags=["Patients"])
-def get_patient(patient_id: int, user: dict = Depends(require_auth)):
+def get_patient(patient_id: int, user: dict = Depends(operations_user)):
     p = registry.get_by_id(patient_id)
-    if not p:
+    if not p or (p.archived_at and user["role"] == "receptionist"):
         raise HTTPException(status_code=404, detail="Patient not found")
     return p
 
 @app.patch("/patients/{patient_id}", response_model=PatientRead, tags=["Patients"])
-def update_patient(patient_id: int, updates: PatientUpdate, user: dict = Depends(require_auth)):
+def update_patient(patient_id: int, updates: PatientUpdate, user: dict = Depends(operations_user)):
     """Update one or more fields of an existing patient."""
     p = registry.get_by_id(patient_id)
-    if not p:
+    if not p or p.archived_at:
         raise HTTPException(status_code=404, detail="Patient not found")
     update_data = updates.model_dump(exclude_unset=True)
     if not update_data:
@@ -323,32 +414,36 @@ def update_patient(patient_id: int, updates: PatientUpdate, user: dict = Depends
 def update_patient_cure_status(
     patient_id: int,
     update: PatientCureUpdate,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(clinical_user),
 ):
-    if user.get("role") not in {"doctor", "admin"}:
-        raise HTTPException(status_code=403, detail="Only doctors or admins can update cure status")
-    if not registry.get_by_id(patient_id):
+    patient = registry.set_cured(patient_id, update.cured, user["user_id"])
+    if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
-    if not registry.set_cured(patient_id, update.cured):
-        raise HTTPException(status_code=400, detail="Unable to update patient status")
-    patient = registry.get_by_id(patient_id)
-    result = patient.__dict__.copy()
-    for field in ("created_at", "cured_at"):
-        if result.get(field) and not isinstance(result[field], str):
-            result[field] = result[field].isoformat()
-    return result
+    return patient
+
+
+@app.patch("/patients/{patient_id}/archive", response_model=PatientRead, tags=["Patients"])
+def update_patient_archive(patient_id: int, update: PatientArchiveUpdate, user: dict = Depends(admin_user)):
+    patient = registry.set_archived(patient_id, update.archived, user["user_id"])
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    if update.archived:
+        queue_manager.forget_archived_patient(patient_id)
+    return patient
 
 @app.get("/patients/phone/{phone}", response_model=PatientRead, tags=["Patients"])
-def get_patient_by_phone(phone: str, user: dict = Depends(require_auth)):
+def get_patient_by_phone(phone: str, user: dict = Depends(operations_user)):
     p = registry.get_by_phone(phone)
-    if not p:
+    if not p or (p.archived_at and user["role"] == "receptionist"):
         raise HTTPException(status_code=404, detail="Patient not found")
     return p
 
 # --- Doctor Routes ---
 
 @app.get("/doctors/", response_model=List[DoctorRead], tags=["Doctors"])
-def list_doctors(status: str = "active", user: dict = Depends(require_auth)):
+def list_doctors(status: str = "active", user: dict = Depends(operations_user)):
+    if user["role"] == "receptionist" and status != "active":
+        raise HTTPException(status_code=403, detail="Only active doctors are available for scheduling")
     if status not in {"active", "archived", "all"}:
         raise HTTPException(status_code=400, detail="status must be active, archived, or all")
     docs = doc_manager.list_all_doctors(status)
@@ -367,7 +462,7 @@ def list_doctors(status: str = "active", user: dict = Depends(require_auth)):
     ]
 
 @app.get("/doctors/{doctor_id}", response_model=DoctorRead, tags=["Doctors"])
-def get_doctor(doctor_id: int, user: dict = Depends(require_auth)):
+def get_doctor(doctor_id: int, user: dict = Depends(clinical_user)):
     d = doc_manager.get_by_id(doctor_id)
     if not d:
         raise HTTPException(status_code=404, detail="Doctor not found")
@@ -384,7 +479,7 @@ def get_doctor(doctor_id: int, user: dict = Depends(require_auth)):
     )
 
 @app.post("/doctors/", response_model=DoctorRead, tags=["Doctors"])
-def register_doctor(doctor: DoctorCreate, user: dict = Depends(require_auth)):
+def register_doctor(doctor: DoctorCreate, user: dict = Depends(admin_user)):
     from db.database import db
     duplicate = db.query_one(
         "SELECT doctor_id FROM doctors WHERE employment_status = 'active' "
@@ -414,7 +509,7 @@ def register_doctor(doctor: DoctorCreate, user: dict = Depends(require_auth)):
     )
 
 @app.patch("/doctors/{doctor_id}", tags=["Doctors"])
-def update_doctor(doctor_id: int, updates: dict, user: dict = Depends(require_auth)):
+def update_doctor(doctor_id: int, updates: dict, user: dict = Depends(admin_user)):
     # Handle time conversion for available_from/to
     if 'available_from' in updates:
         updates['available_from'] = time.fromisoformat(updates['available_from'])
@@ -442,10 +537,8 @@ def update_doctor(doctor_id: int, updates: dict, user: dict = Depends(require_au
 def update_doctor_status(
     doctor_id: int,
     update: DoctorStatusUpdate,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(admin_user),
 ):
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required to update doctor status")
     doctor = doc_manager.get_by_id(doctor_id)
     if not doctor:
         raise HTTPException(status_code=404, detail="Doctor not found")
@@ -466,11 +559,21 @@ def update_doctor_status(
 # --- Appointment Routes ---
 
 @app.get("/appointments/", response_model=List[AppointmentRead], tags=["Appointments"])
-def list_appointments(user: dict = Depends(require_auth)):
+def list_appointments(user: dict = Depends(staff_user)):
     """List all booked appointments."""
     try:
         from db.database import db
-        rows = db.query("SELECT * FROM appointments ORDER BY start_time ASC")
+        rows = db.query(
+            "SELECT a.*, p.name AS patient_name, d.name AS doctor_name, "
+            "n.user_id AS nurse_user_id, n.display_name AS nurse_name, "
+            "r.user_id AS receptionist_user_id, r.display_name AS receptionist_name "
+            "FROM appointments a "
+            "JOIN patients p ON p.patient_id = a.patient_id JOIN doctors d ON d.doctor_id = a.doctor_id "
+            "LEFT JOIN appointment_staff_assignments ns ON ns.appointment_id = a.appointment_id AND ns.role = 'nurse' "
+            "LEFT JOIN appointment_staff_assignments rs ON rs.appointment_id = a.appointment_id AND rs.role = 'receptionist' "
+            "LEFT JOIN users n ON n.user_id = ns.user_id LEFT JOIN users r ON r.user_id = rs.user_id "
+            "ORDER BY a.start_time ASC"
+        )
         result = []
         for row in rows:
             # Explicitly ensure start_time and end_time are handled as strings or formatted objects
@@ -483,6 +586,12 @@ def list_appointments(user: dict = Depends(require_auth)):
                 "appointment_id": row['appointment_id'],
                 "patient_id": row['patient_id'],
                 "doctor_id": row['doctor_id'],
+                "patient_name": row['patient_name'],
+                "doctor_name": row['doctor_name'],
+                "nurse_user_id": row['nurse_user_id'],
+                "nurse_name": row['nurse_name'],
+                "receptionist_user_id": row['receptionist_user_id'],
+                "receptionist_name": row['receptionist_name'],
                 "start_time": st,
                 "end_time": et,
                 "status": row['status'],
@@ -501,7 +610,7 @@ def get_available_appointment_slots(
     date: str,
     duration_minutes: int = 30,
     timezone_offset_minutes: int = 0,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(operations_user),
 ):
     """Offer only appointment starts that fit the doctor's shift and current bookings."""
     from db.database import db
@@ -570,9 +679,9 @@ def get_available_appointment_slots(
     }
 
 @app.post("/appointments/", response_model=AppointmentRead, tags=["Appointments"])
-def book_appointment(apt_req: AppointmentCreate, user: dict = Depends(require_auth)):
+def book_appointment(apt_req: AppointmentCreate, user: dict = Depends(operations_user)):
     patient = registry.get_by_id(apt_req.patient_id)
-    if not patient:
+    if not patient or patient.archived_at:
         raise HTTPException(status_code=404, detail="Patient not found")
 
     doctor = doc_manager.get_by_id(apt_req.doctor_id)
@@ -615,18 +724,66 @@ def book_appointment(apt_req: AppointmentCreate, user: dict = Depends(require_au
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.patch("/appointments/{appointment_id}/cancel", tags=["Appointments"])
-def cancel_appointment(appointment_id: int, user: dict = Depends(require_auth)):
+def cancel_appointment(appointment_id: int, user: dict = Depends(operations_user)):
     """Cancel an appointment by ID."""
     success = scheduler.cancel_appointment(appointment_id)
     if not success:
         raise HTTPException(status_code=404, detail="Appointment not found")
     return {"message": "Appointment cancelled"}
 
+
+@app.patch("/appointments/{appointment_id}/staff", tags=["Appointments"])
+def update_appointment_staff(appointment_id: int, update: AppointmentStaffUpdate, user: dict = Depends(admin_user)):
+    from db.database import db
+
+    appointment_lock = " FOR NO KEY UPDATE" if db.engine == "postgres" else ""
+    user_lock = " FOR SHARE" if db.engine == "postgres" else ""
+    with db.write_transaction():
+        appointment = db.query_one("SELECT status FROM appointments WHERE appointment_id = ?" + appointment_lock, (appointment_id,))
+        if not appointment:
+            raise HTTPException(status_code=404, detail="Appointment not found")
+        if appointment["status"] != "booked":
+            raise HTTPException(status_code=409, detail="Staff can be assigned to booked appointments")
+
+        current = db.query_one(
+            "SELECT user_id FROM appointment_staff_assignments WHERE appointment_id = ? AND role = ?",
+            (appointment_id, update.role),
+        )
+        previous_id = current["user_id"] if current else None
+        people = db.query(
+            "SELECT user_id, role, display_name FROM users WHERE user_id IN (?, ?) ORDER BY user_id" + user_lock,
+            (previous_id, update.user_id),
+        )
+        selected = next((person for person in people if person["user_id"] == update.user_id), None)
+        if update.user_id is not None and (not selected or selected["role"] != update.role):
+            raise HTTPException(status_code=400, detail=f"Select an account with the {update.role} role")
+
+        if previous_id != update.user_id:
+            if previous_id is not None:
+                removal = db.execute(
+                    "DELETE FROM appointment_staff_assignments WHERE appointment_id = ? AND role = ? AND user_id = ?",
+                    (appointment_id, update.role, previous_id),
+                )
+                if removal.rowcount:
+                    record_staff_assignment(db, previous_id, user["user_id"], f"Removed {update.role} assignment", appointment_id)
+            if selected:
+                db.execute(
+                    "INSERT INTO appointment_staff_assignments (appointment_id, role, user_id, assigned_by) VALUES (?, ?, ?, ?)",
+                    (appointment_id, update.role, update.user_id, user["user_id"]),
+                )
+                record_staff_assignment(db, update.user_id, user["user_id"], f"Assigned as {update.role}", appointment_id)
+
+        return {
+            "appointment_id": appointment_id,
+            "role": update.role,
+            "user_id": update.user_id,
+            "display_name": selected["display_name"] if selected else None,
+        }
+
+
 @app.patch("/appointments/{appointment_id}/complete", tags=["Appointments"])
-def complete_appointment(appointment_id: int, completion: Optional[AppointmentCompleteRequest] = None, user: dict = Depends(require_auth)):
+def complete_appointment(appointment_id: int, completion: Optional[AppointmentCompleteRequest] = None, user: dict = Depends(clinical_user)):
     """Complete a visit and advance that doctor's remaining schedule if it finished early."""
-    if user.get("role") not in {"doctor", "admin"}:
-        raise HTTPException(status_code=403, detail="Only doctors or admins can complete appointments")
 
     from db.database import db
     from datetime import datetime, timedelta
@@ -720,15 +877,15 @@ def complete_appointment(appointment_id: int, completion: Optional[AppointmentCo
 # --- Queue Routes ---
 
 @app.post("/queue/add", response_model=dict, tags=["Queue"])
-def add_to_queue(req: QueueAdd, user: dict = Depends(require_auth)):
+def add_to_queue(req: QueueAdd, user: dict = Depends(operations_user)):
     patient = registry.get_by_id(req.patient_id)
-    if not patient:
+    if not patient or patient.archived_at:
         raise HTTPException(status_code=404, detail="Patient not found")
     queue_manager.add_patient(patient, req.priority)
     return {"message": f"Patient {patient.name} added to queue with priority {req.priority}"}
 
 @app.get("/queue/next", response_model=Optional[QueuePatient], tags=["Queue"])
-def pop_next_patient(user: dict = Depends(require_auth)):
+def pop_next_patient(user: dict = Depends(clinical_user)):
     result = queue_manager.pop_next_patient()
     if not result:
         return None
@@ -763,7 +920,7 @@ def pop_next_patient(user: dict = Depends(require_auth)):
     )
 
 @app.get("/queue/list", response_model=List[QueuePatient], tags=["Queue"])
-def list_queue(user: dict = Depends(require_auth)):
+def list_queue(user: dict = Depends(clinical_user)):
     queue = queue_manager.get_queue()
     return [
         QueuePatient(
@@ -782,9 +939,9 @@ def list_queue(user: dict = Depends(require_auth)):
     ]
 
 @app.post("/queue/triage", tags=["Queue"])
-def triage_and_add(patient_id: int, symptoms: str, user: dict = Depends(require_auth)):
+def triage_and_add(patient_id: int, symptoms: str, user: dict = Depends(clinical_user)):
     patient = registry.get_by_id(patient_id)
-    if not patient:
+    if not patient or patient.archived_at:
         raise HTTPException(status_code=404, detail="Patient not found")
     if not symptoms.strip():
         raise HTTPException(status_code=400, detail="Symptoms are required")
@@ -797,7 +954,7 @@ def triage_and_add(patient_id: int, symptoms: str, user: dict = Depends(require_
 # --- Reports ---
 
 @app.get("/reports/financials", response_model=FinancialSummary, tags=["Reports"])
-def get_financials(user: dict = Depends(require_auth)):
+def get_financials(user: dict = Depends(clinical_user)):
     try:
         fin = reporting.get_financial_summary()
     except Exception:
@@ -806,7 +963,7 @@ def get_financials(user: dict = Depends(require_auth)):
     return FinancialSummary(**fin)
 
 @app.get("/dashboard/summary", tags=["Dashboard"])
-def get_dashboard_summary(timezone_offset_minutes: int = 0, user: dict = Depends(require_auth)):
+def get_dashboard_summary(timezone_offset_minutes: int = 0, user: dict = Depends(clinical_user)):
     """Return current dashboard figures and today's real appointment schedule."""
     from db.database import db
     from datetime import date, datetime, timedelta, timezone
@@ -855,11 +1012,11 @@ def get_dashboard_summary(timezone_offset_minutes: int = 0, user: dict = Depends
         wait_minutes.append(max(0, (now - arrived).total_seconds() / 60))
 
     financials = reporting.get_financial_summary()
-    active_patients = db.query_one("SELECT COUNT(*) AS total FROM patients WHERE is_cured = 0")["total"]
+    active_patients = db.query_one("SELECT COUNT(*) AS total FROM patients WHERE is_cured = 0 AND archived_at IS NULL")["total"]
     total_doctors = db.query_one("SELECT COUNT(*) AS total FROM doctors WHERE employment_status = 'active'")["total"]
     recent_patients = db.query(
         "SELECT patient_id, name, is_cured, created_at FROM patients "
-        "WHERE is_cured = 0 ORDER BY created_at DESC LIMIT 4"
+        "WHERE is_cured = 0 AND archived_at IS NULL ORDER BY created_at DESC LIMIT 4"
     )
     recent = []
     for row in recent_patients:
@@ -886,7 +1043,7 @@ def get_dashboard_summary(timezone_offset_minutes: int = 0, user: dict = Depends
     }
 
 @app.get("/history/", tags=["History"])
-def get_history(user: dict = Depends(require_auth)):
+def get_history(user: dict = Depends(clinical_user)):
     """Return a unified, newest-first view of persisted hospital records."""
     from db.database import db
 
@@ -908,7 +1065,13 @@ def get_history(user: dict = Depends(require_auth)):
             })
 
     add_events("Patients", db.query("SELECT patient_id, name, created_at FROM patients"), "created_at", "name", lambda r: f"Patient registered · #{r['patient_id']}", "patient_id", "patient_id")
-    add_events("Patients", db.query("SELECT patient_id, name, cured_at FROM patients WHERE is_cured = 1 AND cured_at IS NOT NULL"), "cured_at", "name", lambda r: f"Patient marked cured · #{r['patient_id']}", "patient_id", "patient_id")
+    add_events("Patients", db.query("SELECT p.patient_id, p.name, p.cured_at FROM patients p WHERE p.is_cured = 1 AND p.cured_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM patient_status_events e WHERE e.patient_id = p.patient_id AND e.action = 'cured')"), "cured_at", "name", lambda r: f"Patient marked cured · #{r['patient_id']}", "patient_id", "patient_id")
+    status_events = db.query(
+        "SELECT e.event_id, e.patient_id, e.action, e.created_at, p.name, u.display_name "
+        "FROM patient_status_events e JOIN patients p ON p.patient_id = e.patient_id "
+        "JOIN users u ON u.user_id = e.changed_by"
+    )
+    add_events("Patients", status_events, "created_at", "name", lambda r: f"Patient {r['action']} by {r['display_name']}", "event_id", "patient_id")
     add_events("Doctors", db.query("SELECT doctor_id, name, department, employment_status, status_updated_at FROM doctors"), "status_updated_at", "name", lambda r: f"{r['employment_status'].title()} · {r['department']} · Doctor #{r['doctor_id']}", "doctor_id")
     add_events("Appointments", db.query("SELECT a.appointment_id, a.patient_id, a.start_time, a.status, a.category, p.name AS patient_name, d.name AS doctor_name FROM appointments a JOIN patients p ON p.patient_id = a.patient_id JOIN doctors d ON d.doctor_id = a.doctor_id"), "start_time", "patient_name", lambda r: f"Appointment #{r['appointment_id']} · Dr. {r['doctor_name']} · {r['status']} · {r['category'] or 'routine'}", "appointment_id", "patient_id")
     add_events("Appointments", db.query("SELECT a.appointment_id, a.patient_id, a.completed_at, p.name AS patient_name, d.name AS doctor_name FROM appointments a JOIN patients p ON p.patient_id = a.patient_id JOIN doctors d ON d.doctor_id = a.doctor_id WHERE a.completed_at IS NOT NULL"), "completed_at", "patient_name", lambda r: f"Appointment #{r['appointment_id']} completed · Dr. {r['doctor_name']}", "appointment_id", "patient_id")
@@ -925,7 +1088,7 @@ def get_history(user: dict = Depends(require_auth)):
     return {"events": events[:500], "count": len(events), "as_of": datetime.now().isoformat()}
 
 @app.post("/reports/snapshot", tags=["Reports"])
-def save_report_snapshot(user: dict = Depends(require_auth)):
+def save_report_snapshot(user: dict = Depends(clinical_user)):
     """Save the currently calculated reports as a timestamped history record."""
     from db.database import db
     from datetime import datetime
@@ -943,23 +1106,27 @@ def save_report_snapshot(user: dict = Depends(require_auth)):
     return {"snapshot_id": cursor.lastrowid, "generated_at": datetime.now().isoformat()}
 
 @app.get("/reports/doctor-load", response_model=List[DoctorLoad], tags=["Reports"])
-def get_doctor_load(user: dict = Depends(require_auth)):
+def get_doctor_load(user: dict = Depends(clinical_user)):
     return reporting.get_doctor_load()
 
 @app.get("/reports/department-footfall", response_model=List[DeptFootfall], tags=["Reports"])
-def get_dept_footfall(user: dict = Depends(require_auth)):
+def get_dept_footfall(user: dict = Depends(clinical_user)):
     return reporting.get_departmental_footfall()
 
 @app.get("/reports/peak-hours", tags=["Reports"])
-def get_peak_hours(user: dict = Depends(require_auth)):
+def get_peak_hours(user: dict = Depends(clinical_user)):
     return reporting.get_peak_hours()
 
 @app.get("/reports/demographics", tags=["Reports"])
-def get_demographics(user: dict = Depends(require_auth)):
+def get_demographics(user: dict = Depends(clinical_user)):
     return reporting.get_patient_demographics()
 
 @app.websocket("/ws/queue")
 async def websocket_queue(websocket: WebSocket):
+    user = await asyncio.to_thread(get_current_user, websocket)
+    if not user or user["role"] not in {"admin", "doctor"}:
+        await websocket.close(code=1008)
+        return
     await queue_notifier.connect(websocket)
     try:
         while True:
@@ -970,7 +1137,7 @@ async def websocket_queue(websocket: WebSocket):
 # --- Billing Routes ---
 
 @app.get("/billing/", response_model=List[dict], tags=["Billing"])
-def list_bills(user: dict = Depends(require_auth)):
+def list_bills(user: dict = Depends(operations_user)):
     from db.database import db
     rows = db.query(
         "SELECT b.*, "
@@ -985,14 +1152,14 @@ def list_bills(user: dict = Depends(require_auth)):
         bill["pending_amount"] = float(bill.get("pending_amount") or 0)
         if bill["payment_status"] != "paid" and bill["pending_amount"] > 0:
             bill["payment_status"] = "processing"
-        bill["remaining_amount"] = max(0, float(bill["amount"]) - bill["amount_paid"])
+        bill["remaining_amount"] = 0 if bill["payment_status"] == "paid" else max(0, round(float(bill["amount"]) - bill["amount_paid"], 2))
         bill["collected_amount"] = float(bill["amount"]) if bill["payment_status"] == "paid" else bill["amount_paid"]
         bill["outstanding_amount"] = 0 if bill["payment_status"] == "paid" else bill["remaining_amount"]
         result.append(bill)
     return result
 
 @app.get("/billing/{bill_id}", response_model=dict, tags=["Billing"])
-def get_bill(bill_id: int, user: dict = Depends(require_auth)):
+def get_bill(bill_id: int, user: dict = Depends(operations_user)):
     from db.database import db
     row = db.query_one("SELECT * FROM bills WHERE bill_id = ?", (bill_id,))
     if not row:
@@ -1000,7 +1167,7 @@ def get_bill(bill_id: int, user: dict = Depends(require_auth)):
     return row
 
 @app.post("/billing/generate", tags=["Billing"])
-def generate_bill(req: BillGenerateRequest, user: dict = Depends(require_auth)):
+def generate_bill(req: BillGenerateRequest, user: dict = Depends(operations_user)):
     appointment_id = req.appointment_id
     from db.database import db
     row = db.query_one("SELECT * FROM appointments WHERE appointment_id = ?", (appointment_id,))
@@ -1055,56 +1222,104 @@ def generate_bill(req: BillGenerateRequest, user: dict = Depends(require_auth)):
         "already_exists": False,
     }
 
-@app.post("/billing/pay", tags=["Billing"])
-def pay_bill(req: BillPaymentRequest, user: dict = Depends(require_auth)):
-    from db.database import db
-    bill_id = req.bill_id
-    bill = db.query_one("SELECT bill_id, amount, payment_status FROM bills WHERE bill_id = ?", (bill_id,))
-    if not bill:
+def lock_invoice(db, bill_id):
+    lock = " FOR NO KEY UPDATE" if db.engine == "postgres" else ""
+    invoice = db.query_one("SELECT amount, payment_status FROM bills WHERE bill_id = ?" + lock, (bill_id,))
+    if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
-    if bill["payment_status"] == "paid":
-        raise HTTPException(status_code=409, detail="This invoice is already marked paid")
-    pending = db.query_one("SELECT COUNT(*) AS total FROM payments WHERE bill_id = ? AND status = 'processing'", (bill_id,))
-    if pending["total"]:
-        raise HTTPException(status_code=409, detail="A payment for this invoice is already in process")
-    paid_row = db.query_one("SELECT COALESCE(SUM(amount), 0) AS amount_paid FROM payments WHERE bill_id = ? AND status = 'completed'", (bill_id,))
-    remaining = max(0, float(bill["amount"]) - float(paid_row["amount_paid"] or 0))
-    if req.amount > remaining + 0.00001:
-        raise HTTPException(status_code=400, detail=f"Payment exceeds the remaining balance of ₹{remaining:.2f}")
+    return invoice
 
-    success = billing.process_patient_payment(bill_id, req.amount, req.method)
-    if not success:
-        raise HTTPException(status_code=400, detail="Payment processing failed")
 
-    updated = db.query_one("SELECT payment_status FROM bills WHERE bill_id = ?", (bill_id,))
-    payment = db.query_one("SELECT payment_id, transaction_id, status FROM payments WHERE bill_id = ? ORDER BY payment_id DESC LIMIT 1", (bill_id,))
-    return {
-        "message": "Payment processed successfully",
-        "bill_id": bill_id,
-        "payment_id": payment["payment_id"] if payment else None,
-        "transaction_id": payment["transaction_id"] if payment else None,
-        "payment_status": payment["status"] if payment else "processing",
-        "invoice_status": updated["payment_status"],
-    }
+def invoice_balance(db, bill_id, amount):
+    payments = db.query_one(
+        "SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE bill_id = ? AND status = 'completed'",
+        (bill_id,),
+    )
+    return max(0, round(float(amount) - float(payments["total"]), 2))
+
+
+@app.post("/billing/pay", tags=["Billing"])
+def pay_bill(req: BillPaymentRequest, user: dict = Depends(operations_user)):
+    from db.database import db
+
+    with db.write_transaction():
+        bill = lock_invoice(db, req.bill_id)
+        if bill["payment_status"] == "paid":
+            raise HTTPException(status_code=409, detail="This invoice is already marked paid")
+        pending = db.query_one(
+            "SELECT payment_id FROM payments WHERE bill_id = ? AND status = 'processing' LIMIT 1", (req.bill_id,),
+        )
+        if pending:
+            raise HTTPException(status_code=409, detail="A payment for this invoice is already in process")
+        remaining = invoice_balance(db, req.bill_id, bill["amount"])
+        if float(req.amount) > remaining:
+            raise HTTPException(status_code=400, detail=f"Payment exceeds the remaining balance of ₹{remaining:.2f}")
+
+        payment = payment_manager.process_payment(req.bill_id, float(req.amount), req.method)
+        if payment.status == "processing":
+            status = "processing"
+        else:
+            status = "paid" if invoice_balance(db, req.bill_id, bill["amount"]) == 0 else "unpaid"
+        db.execute("UPDATE bills SET payment_status = ? WHERE bill_id = ?", (status, req.bill_id))
+        return {
+            "message": "Payment recorded",
+            "bill_id": req.bill_id,
+            "payment_id": payment.payment_id,
+            "transaction_id": payment.transaction_id,
+            "payment_status": payment.status,
+            "invoice_status": status,
+        }
+
 
 @app.patch("/billing/{bill_id}/status", tags=["Billing"])
-def update_bill_status(bill_id: int, update: BillStatusUpdate, user: dict = Depends(require_auth)):
+def update_bill_status(bill_id: int, update: BillStatusUpdate, user: dict = Depends(operations_user)):
     from db.database import db
-    if not db.query_one("SELECT bill_id FROM bills WHERE bill_id = ?", (bill_id,)):
-        raise HTTPException(status_code=404, detail="Invoice not found")
-    next_payment_status = "completed" if update.payment_status == "paid" else "failed"
-    db.execute(
-        "UPDATE payments SET status = ? WHERE bill_id = ? AND status = 'processing'",
-        (next_payment_status, bill_id),
-    )
-    db.execute("UPDATE bills SET payment_status = ? WHERE bill_id = ?", (update.payment_status, bill_id))
-    return {"bill_id": bill_id, "payment_status": update.payment_status}
+
+    with db.write_transaction():
+        bill = lock_invoice(db, bill_id)
+        if update.payment_status == "paid":
+            if bill["payment_status"] == "paid":
+                return {"bill_id": bill_id, "payment_status": "paid"}
+            if update.confirm_pending:
+                db.execute(
+                    "UPDATE payments SET status = 'completed' WHERE bill_id = ? AND status = 'processing'", (bill_id,),
+                )
+            elif db.query_one(
+                "SELECT payment_id FROM payments WHERE bill_id = ? AND status = 'processing' LIMIT 1", (bill_id,),
+            ):
+                raise HTTPException(status_code=409, detail="This invoice now has a pending payment. Refresh it before proceeding.")
+            remaining = invoice_balance(db, bill_id, bill["amount"])
+            if remaining and not update.confirm_pending:
+                payment_manager.process_payment(bill_id, remaining, "Manual")
+                remaining = 0
+            status = "unpaid" if remaining else "paid"
+        else:
+            if invoice_balance(db, bill_id, bill["amount"]) == 0:
+                raise HTTPException(status_code=409, detail="Completed payments cover this invoice")
+            db.execute("UPDATE payments SET status = 'failed' WHERE bill_id = ? AND status = 'processing'", (bill_id,))
+            status = "unpaid"
+        db.execute("UPDATE bills SET payment_status = ? WHERE bill_id = ?", (status, bill_id))
+        return {"bill_id": bill_id, "payment_status": status}
+
 
 # --- Clinical Routes ---
 
+def check_clinical_patient(patient_id, user, *, writing=False):
+    from db.database import db
+    patient = db.query_one("SELECT archived_at FROM patients WHERE patient_id = ?", (patient_id,))
+    if not patient or (patient["archived_at"] and (writing or user["role"] not in {"admin", "doctor"})):
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+
+def check_clinical_author(doctor_id, user):
+    if user["role"] == "doctor" and user["doctor_id"] and doctor_id != user["doctor_id"]:
+        raise HTTPException(status_code=403, detail="Use your linked doctor profile for clinical entries")
+
 
 @app.post("/clinical/ehr", response_model=HealthRecordRead, tags=["Clinical"])
-def add_health_record(rec: HealthRecordCreate, user: dict = Depends(require_auth)):
+def add_health_record(rec: HealthRecordCreate, user: dict = Depends(clinical_user)):
+    check_clinical_patient(rec.patient_id, user, writing=True)
+    check_clinical_author(rec.doctor_id, user)
     try:
         record_id = ehr_manager.add_record(rec.patient_id, rec.doctor_id, rec.note, rec.category)
         # Return as HealthRecordRead by fetching the created record
@@ -1122,7 +1337,8 @@ def add_health_record(rec: HealthRecordCreate, user: dict = Depends(require_auth
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/clinical/ehr/{patient_id}", response_model=List[HealthRecordRead], tags=["Clinical"])
-def get_ehr(patient_id: int, user: dict = Depends(require_auth)):
+def get_ehr(patient_id: int, user: dict = Depends(clinical_user)):
+    check_clinical_patient(patient_id, user)
     try:
         history = ehr_manager.get_patient_history(patient_id)
         serialized_history = []
@@ -1138,7 +1354,9 @@ def get_ehr(patient_id: int, user: dict = Depends(require_auth)):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/clinical/prescriptions", response_model=PrescriptionRead, tags=["Clinical"])
-def issue_prescription(pres: PrescriptionCreate, user: dict = Depends(require_auth)):
+def issue_prescription(pres: PrescriptionCreate, user: dict = Depends(clinical_user)):
+    check_clinical_patient(pres.patient_id, user, writing=True)
+    check_clinical_author(pres.doctor_id, user)
     p_id = prescription_manager.issue_prescription(
         pres.patient_id, pres.doctor_id, pres.medication, pres.dosage, pres.frequency, pres.duration
     )
@@ -1146,15 +1364,18 @@ def issue_prescription(pres: PrescriptionCreate, user: dict = Depends(require_au
     return next(p for p in prescriptions if p.prescription_id == p_id)
 
 @app.get("/clinical/prescriptions/{patient_id}", response_model=List[PrescriptionRead], tags=["Clinical"])
-def get_prescriptions(patient_id: int, user: dict = Depends(require_auth)):
+def get_prescriptions(patient_id: int, user: dict = Depends(staff_user)):
+    check_clinical_patient(patient_id, user)
     return prescription_manager.get_patient_prescriptions(patient_id)
 
 @app.post("/clinical/labs", response_model=LabResultRead, tags=["Clinical"])
-def add_lab_result(lab: LabResultCreate, user: dict = Depends(require_auth)):
+def add_lab_result(lab: LabResultCreate, user: dict = Depends(clinical_user)):
+    check_clinical_patient(lab.patient_id, user, writing=True)
     lab_id = lab_manager.add_result(lab.patient_id, lab.test_name, lab.result_value, lab.unit, lab.status)
     labs = lab_manager.get_patient_labs(lab.patient_id)
     return next(l for l in labs if l.lab_id == lab_id)
 
 @app.get("/clinical/labs/{patient_id}", response_model=List[LabResultRead], tags=["Clinical"])
-def get_labs(patient_id: int, user: dict = Depends(require_auth)):
+def get_labs(patient_id: int, user: dict = Depends(staff_user)):
+    check_clinical_patient(patient_id, user)
     return lab_manager.get_patient_labs(patient_id)

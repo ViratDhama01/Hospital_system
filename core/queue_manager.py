@@ -52,6 +52,10 @@ class QueueManager:
                 heapq.heapify(self._urgent_heap)
                 return
 
+    def forget_archived_patient(self, patient_id: int):
+        """Discard the cached queue entry after the registry archives the patient."""
+        self._remove(patient_id)
+
     def _load_queue_from_db(self):
         """Restore both FIFO routine entries and urgent heap entries at startup."""
         rows = db.query(

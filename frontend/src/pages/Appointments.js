@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useOutletContext, useSearchParams } from 'react-router-dom';
 import { Calendar, Clock, User, CheckCircle, X, AlertTriangle } from 'lucide-react';
 import { api } from '../api';
+import { canRunOperations, isClinician } from '../access';
 
 const localDateValue = () => {
   const now = new Date();
@@ -10,12 +11,15 @@ const localDateValue = () => {
 };
 
 const Appointments = () => {
+  const { role, user_id: userId, doctor_id: doctorId } = useOutletContext();
+  const canSchedule = canRunOperations(role);
+  const canComplete = isClinician(role);
   const [searchParams, setSearchParams] = useSearchParams();
   const [appointments, setAppointments] = useState([]);
   const [patients, setPatients] = useState([]);
   const [doctors, setDoctors] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [canComplete, setCanComplete] = useState(false);
+  const [onlyMine, setOnlyMine] = useState(false);
   const [availableSlots, setAvailableSlots] = useState([]);
   const [slotsLoading, setSlotsLoading] = useState(false);
   const [slotsError, setSlotsError] = useState('');
@@ -36,8 +40,8 @@ const Appointments = () => {
   }, []);
 
   useEffect(() => {
-    if (searchParams.get('new') === '1') setShowModal(true);
-  }, [searchParams]);
+    if (canSchedule && searchParams.get('new') === '1') setShowModal(true);
+  }, [canSchedule, searchParams]);
 
   useEffect(() => {
     if (!showModal || !bookingData.doctor_id || !bookingData.appointment_date) {
@@ -76,16 +80,14 @@ const Appointments = () => {
   const fetchAppointments = async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const [data, patientData, doctorData, auth] = await Promise.all([
+      const [data, patientData, doctorData] = await Promise.all([
         api.get('/appointments/'),
-        api.get('/patients/'),
-        api.get('/doctors/'),
-        api.get('/auth/status')
+        canSchedule ? api.get('/patients/directory?active_only=true') : [],
+        canSchedule ? api.get('/doctors/') : [],
       ]);
       setAppointments(data);
       setPatients(patientData);
       setDoctors(doctorData);
-      setCanComplete(['doctor', 'admin'].includes(auth?.user?.role));
     } catch (error) {
       alert('Failed to fetch appointments');
     } finally {
@@ -144,7 +146,12 @@ const Appointments = () => {
     }
   };
 
-  const todayAppointments = appointments.filter((appointment) =>
+  const canFilterAssignments = role === 'nurse' || role === 'receptionist' || (role === 'doctor' && Boolean(doctorId));
+  const assignedToMe = (appointment) => role === 'doctor'
+    ? appointment.doctor_id === doctorId
+    : (role === 'nurse' || role === 'receptionist') && appointment[`${role}_user_id`] === userId;
+  const visibleAppointments = onlyMine ? appointments.filter(assignedToMe) : appointments;
+  const todayAppointments = visibleAppointments.filter((appointment) =>
     new Date(appointment.start_time).toDateString() === new Date().toDateString() && appointment.status !== 'cancelled'
   );
 
@@ -153,16 +160,23 @@ const Appointments = () => {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-clinical-dark">Appointments</h1>
-          <p className="text-slate-500">Schedule and manage patient visits.</p>
+          <p className="text-slate-500">{canSchedule ? 'Schedule and manage patient visits.' : 'View scheduled patient visits.'}</p>
         </div>
-        <button
+        {canSchedule && <button
           onClick={() => setShowModal(true)}
           className="btn-primary flex items-center gap-2"
         >
           <Calendar size={20}/>
           <span>Book Appointment</span>
-        </button>
+        </button>}
       </div>
+
+      {canFilterAssignments && (
+        <button type="button" aria-pressed={onlyMine} onClick={() => setOnlyMine(!onlyMine)}
+          className={`rounded-lg border px-4 py-2 font-medium ${onlyMine ? 'border-clinical-blue bg-clinical-blue text-white' : 'border-slate-300 bg-white text-slate-700'}`}>
+          My assignments
+        </button>
+      )}
 
       {showModal && (
         <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
@@ -274,18 +288,22 @@ const Appointments = () => {
           <div className="space-y-4">
             {loading ? (
               <div className="py-10 text-center text-slate-400">Loading appointments...</div>
-            ) : appointments.length === 0 ? (
-              <div className="py-10 text-center text-slate-400">No upcoming appointments.</div>
+            ) : visibleAppointments.length === 0 ? (
+              <div className="py-10 text-center text-slate-500">{onlyMine ? 'No appointments assigned to you.' : 'No upcoming appointments.'}</div>
             ) : (
-              appointments.map((apt) => (
+              visibleAppointments.map((apt) => (
                 <div key={apt.appointment_id} className="flex items-center justify-between p-4 border border-slate-100 rounded-xl hover:bg-slate-50 transition-colors">
                   <div className="flex items-center gap-4">
                     <div className="w-12 h-12 bg-blue-100 rounded-full flex items-center justify-center text-blue-600 font-bold">
                       P{apt.patient_id}
                     </div>
                     <div>
-                      <p className="font-medium text-clinical-dark">Appointment #{apt.appointment_id}</p>
-                      <p className="text-xs text-slate-500">Doctor ID: {apt.doctor_id} • {new Date(apt.start_time).toLocaleString()}</p>
+                      <p className="font-medium text-clinical-dark">{apt.patient_name || `Appointment #${apt.appointment_id}`}</p>
+                      <p className="text-xs text-slate-500">{apt.doctor_name ? `Dr. ${apt.doctor_name}` : `Doctor #${apt.doctor_id}`} · {new Date(apt.start_time).toLocaleString()}</p>
+                      {apt.nurse_name && <p className="text-xs text-slate-600">Nurse: {apt.nurse_name}</p>}
+                      {apt.receptionist_name && <p className="text-xs text-slate-600">Receptionist: {apt.receptionist_name}</p>}
+                      {canFilterAssignments && assignedToMe(apt) && <p className="mt-1 text-xs font-semibold text-clinical-blue">Assigned to you</p>}
+                      {role === 'admin' && apt.status === 'booked' && <Link to={`/staff?tab=appointments&appointment_id=${apt.appointment_id}`} className="mt-1 inline-block text-xs font-semibold text-clinical-blue hover:underline">Assign staff</Link>}
                       {apt.category === 'emergency' && <span className="mt-1 inline-flex items-center gap-1 text-xs font-semibold text-rose-600"><AlertTriangle size={13}/>Emergency · priority {apt.priority}</span>}
                     </div>
                   </div>
@@ -303,11 +321,11 @@ const Appointments = () => {
                           className="flex items-center gap-1 rounded-lg bg-emerald-50 px-2 py-1 text-xs font-semibold text-emerald-700 hover:bg-emerald-100"
                           title="Mark appointment completed"
                         ><CheckCircle size={15}/>Complete</button>}
-                        <button
+                        {canSchedule && <button
                           onClick={() => handleCancel(apt.appointment_id)}
                           className="p-2 text-slate-400 hover:text-red-500 transition-colors"
                           title="Cancel Appointment"
-                        ><X size={18}/></button>
+                        ><X size={18}/></button>}
                       </>
                     )}
                   </div>

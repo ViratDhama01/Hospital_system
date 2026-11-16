@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useOutletContext } from 'react-router-dom';
 import { ArrowLeft, User, Save, Activity } from 'lucide-react';
 import { api } from '../api';
 
 const DoctorProfile = () => {
+  const { role } = useOutletContext();
   const { id } = useParams();
   const navigate = useNavigate();
   const [doctor, setDoctor] = useState(null);
@@ -53,12 +54,12 @@ const DoctorProfile = () => {
             <p className="text-slate-500">{doctor.specialization} • {doctor.department}</p>
           </div>
         </div>
-        <button
+        {role === 'admin' && <button
           onClick={() => isEditing ? handleSave() : setIsEditing(true)}
           className={`px-4 py-2 rounded-lg font-medium transition-colors ${isEditing ? 'bg-emerald-500 text-white' : 'bg-clinical-blue text-white'}`}
         >
           {isEditing ? 'Save Changes' : 'Edit Profile'}
-        </button>
+        </button>}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">

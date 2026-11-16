@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from uuid import uuid4
 from jose import JWTError, jwt
 import bcrypt
 from db.database import db
@@ -16,7 +16,10 @@ class AuthManager:
         # hashed_password from DB is bytes or string
         if isinstance(hashed_password, str):
             hashed_password = hashed_password.encode('utf-8')
-        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password)
+        try:
+            return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password)
+        except (TypeError, ValueError):
+            return False
 
     def get_password_hash(self, password):
         salt = bcrypt.gensalt()
@@ -24,28 +27,46 @@ class AuthManager:
         return hashed.decode('utf-8')
 
     def create_access_token(self, data: dict):
-        to_encode = data.copy()
-        # Use timezone-aware UTC so .timestamp() gives the correct Unix epoch
+        session_id = uuid4().hex
         expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        to_encode.update({"exp": int(expire.timestamp())})
-        return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+        db.execute("DELETE FROM auth_sessions WHERE expires_at <= CURRENT_TIMESTAMP")
+        db.execute(
+            "INSERT INTO auth_sessions (session_id, user_id, expires_at) VALUES (?, ?, ?)",
+            (session_id, data["user_id"], expire.replace(tzinfo=None).isoformat()),
+        )
+        return jwt.encode({"jti": session_id, "exp": int(expire.timestamp())}, SECRET_KEY, algorithm=ALGORITHM)
 
     def decode_access_token(self, token: str):
         try:
             payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-            # Payload contains 'username', not 'sub'
-            return payload if payload.get("username") else None
+            session_id = payload.get("jti")
         except JWTError:
             return None
+        if not session_id:
+            return None
+        user = db.query_one(
+            "SELECT u.user_id, u.username, u.display_name, u.role, u.doctor_id, s.session_id "
+            "FROM auth_sessions s JOIN users u ON u.user_id = s.user_id LEFT JOIN doctors d ON d.doctor_id = u.doctor_id "
+            "WHERE s.session_id = ? AND (u.doctor_id IS NULL OR d.employment_status = 'active')",
+            (session_id,),
+        )
+        return dict(user) if user else None
 
-    def create_user(self, username, password, role="receptionist", display_name=None):
+    def revoke_session(self, session_id):
+        db.execute("DELETE FROM auth_sessions WHERE session_id = ?", (session_id,))
+
+    def create_user(self, username, password, role="receptionist", display_name=None, doctor_id=None):
         hashed_pw = self.get_password_hash(password)
-        query = "INSERT INTO users (username, hashed_password, role, display_name) VALUES (?, ?, ?, ?)"
-        cursor = db.execute(query, (username, hashed_pw, role, display_name or username))
+        query = "INSERT INTO users (username, hashed_password, role, display_name, doctor_id) VALUES (?, ?, ?, ?, ?)"
+        cursor = db.execute(query, (username, hashed_pw, role, display_name or username, doctor_id))
         return cursor.lastrowid
 
     def authenticate_user(self, username, password):
-        row = db.query_one("SELECT * FROM users WHERE username = ?", (username,))
+        row = db.query_one(
+            "SELECT u.* FROM users u LEFT JOIN doctors d ON d.doctor_id = u.doctor_id "
+            "WHERE u.username = ? AND (u.doctor_id IS NULL OR d.employment_status = 'active')",
+            (username.strip(),),
+        )
         if not row:
             return None
 
@@ -54,7 +75,8 @@ class AuthManager:
                 "user_id": row['user_id'],
                 "username": row['username'],
                 "role": row['role'],
-                "display_name": row['display_name']
+                "display_name": row['display_name'],
+                "doctor_id": row['doctor_id'],
             }
         return None
 

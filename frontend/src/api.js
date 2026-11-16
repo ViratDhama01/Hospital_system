@@ -1,4 +1,7 @@
-const API_URLS = ['http://127.0.0.1:8000', 'http://localhost:8000'];
+const configuredApiUrl = process.env.REACT_APP_API_URL;
+const API_URLS = configuredApiUrl
+  ? [configuredApiUrl]
+  : ['http://127.0.0.1:8000', 'http://localhost:8000'];
 let currentApiUrlIndex = 0;
 
 export const apiRequest = async (endpoint, options = {}) => {
@@ -20,36 +23,29 @@ export const apiRequest = async (endpoint, options = {}) => {
     },
   };
 
+  let response;
   try {
-    const response = await fetch(`${API_URLS[currentApiUrlIndex]}${endpoint}`, config);
-
-    if (response.status === 401) {
-      localStorage.removeItem('access_token');
-      window.location.href = '/';
-      return;
-    }
-
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      throw new Error(errorData.detail || `Server error: ${response.status} ${response.statusText}`);
-    }
-
-    return await response.json();
+    response = await fetch(`${API_URLS[currentApiUrlIndex]}${endpoint}`, config);
   } catch (error) {
-    if (currentApiUrlIndex === 0) {
-      currentApiUrlIndex = 1;
-      try {
-        const response = await fetch(`${API_URLS[currentApiUrlIndex]}${endpoint}`, config);
-        if (response.ok) {
-          return await response.json();
-        }
-      } catch (fallbackError) {
-        console.error(`Both API URLs failed:`, fallbackError);
-      }
-    }
-    console.error(`API Error [${endpoint}]:`, error);
-    throw error;
+    if (config.method !== 'GET' || currentApiUrlIndex + 1 >= API_URLS.length) throw error;
+    currentApiUrlIndex += 1;
+    response = await fetch(`${API_URLS[currentApiUrlIndex]}${endpoint}`, config);
   }
+
+  if (response.status === 401) {
+    // Ignore a stale response from a request sent before a new login or token rotation.
+    if (token && localStorage.getItem('access_token') === token) {
+      localStorage.removeItem('access_token');
+      window.location.replace('/');
+    }
+  }
+
+  if (!response.ok) {
+    const { detail } = await response.json().catch(() => ({}));
+    const message = Array.isArray(detail) ? detail.map((item) => item.msg).join('. ') : detail;
+    throw new Error(message || `Request failed (${response.status})`);
+  }
+  return response.status === 204 ? null : response.json();
 };
 
 export const api = {

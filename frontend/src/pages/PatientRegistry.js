@@ -1,16 +1,19 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Search, X, HeartPulse, RotateCcw } from 'lucide-react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Plus, Search, X, HeartPulse, RotateCcw, Archive } from 'lucide-react';
+import { useNavigate, useOutletContext, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
+import { isClinician } from '../access';
 
 const PatientRegistry = () => {
   const navigate = useNavigate();
+  const { role } = useOutletContext();
   const [searchParams, setSearchParams] = useSearchParams();
   const [patients, setPatients] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [patientStatus, setPatientStatus] = useState('active');
-  const [canUpdateCure, setCanUpdateCure] = useState(false);
+  const [statusUpdating, setStatusUpdating] = useState(false);
+  const [statusError, setStatusError] = useState('');
   const [showModal, setShowModal] = useState(false);
   const [newPatient, setNewPatient] = useState({
     name: '', dob: '', gender: 'Male', phone: '', address: '', blood_group: 'O+'
@@ -32,12 +35,7 @@ const PatientRegistry = () => {
   const fetchPatients = async () => {
     try {
       setLoading(true);
-      const [data, auth] = await Promise.all([
-        api.get(`/patients/?status=${patientStatus}`),
-        api.get('/auth/status')
-      ]);
-      setPatients(data);
-      setCanUpdateCure(['doctor', 'admin'].includes(auth?.user?.role));
+      setPatients(await api.get(`/patients/?status=${patientStatus}`));
     } catch (error) {
       alert('Failed to fetch patients');
     } finally {
@@ -58,20 +56,28 @@ const PatientRegistry = () => {
     }
   };
 
-  const setCureStatus = async (patient, cured) => {
-    const action = cured ? 'move this patient to cured history' : 'restore this patient to the active registry';
-    if (!window.confirm(`Are you sure you want to ${action}?`)) return;
+  const updateStatus = async (patient, endpoint, payload, question) => {
+    if (!window.confirm(question)) return;
+    setStatusUpdating(true);
+    setStatusError('');
     try {
-      await api.patch(`/patients/${patient.patient_id}/cure`, { cured });
+      await api.patch(`/patients/${patient.patient_id}/${endpoint}`, payload);
       await fetchPatients();
     } catch (error) {
-      alert(error.message || 'Unable to update patient status');
+      setStatusError(error.message || 'Unable to update patient status');
+    } finally {
+      setStatusUpdating(false);
     }
+  };
+
+  const selectStatus = (status) => {
+    setStatusError('');
+    setPatientStatus(status);
   };
 
   const filteredPatients = patients.filter(p =>
     p.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    p.phone.includes(searchTerm)
+    p.phone.includes(searchTerm) || String(p.patient_id).includes(searchTerm)
   );
 
   return (
@@ -193,15 +199,18 @@ const PatientRegistry = () => {
             />
           </div>
           <div className="flex gap-2">
-            <button onClick={() => setPatientStatus('active')} className={`px-4 py-2 rounded-lg font-medium ${patientStatus === 'active' ? 'bg-clinical-blue text-white' : 'border border-slate-200 text-slate-600'}`}>
-              Active patients
-            </button>
-            <button onClick={() => setPatientStatus('cured')} className={`px-4 py-2 rounded-lg font-medium ${patientStatus === 'cured' ? 'bg-clinical-blue text-white' : 'border border-slate-200 text-slate-600'}`}>
-              Cured history
-            </button>
+            {[
+              ['active', 'Active patients'], ['cured', 'Cured history'],
+              ...(role === 'admin' ? [['archived', 'Archived']] : []),
+            ].map(([status, label]) => (
+              <button key={status} onClick={() => selectStatus(status)} disabled={statusUpdating} className={`px-4 py-2 rounded-lg font-medium ${patientStatus === status ? 'bg-clinical-blue text-white' : 'border border-slate-200 text-slate-600'}`}>
+                {label}
+              </button>
+            ))}
           </div>
         </div>
 
+        {statusError && <p role="alert" className="mb-4 text-sm text-rose-700">{statusError}</p>}
         {loading ? (
           <div className="py-20 text-center text-slate-500">Loading patients...</div>
         ) : (
@@ -236,13 +245,22 @@ const PatientRegistry = () => {
                         >
                           View Profile
                         </button>
-                        {canUpdateCure && <button
-                          onClick={() => setCureStatus(p, patientStatus !== 'cured')}
+                        {isClinician(role) && patientStatus !== 'archived' && <button
+                          disabled={statusUpdating}
+                          onClick={() => updateStatus(p, 'cure', { cured: !p.is_cured }, p.is_cured ? 'Restore this patient to the active registry?' : 'Mark this patient as cured?')}
                           className={`flex items-center gap-1 text-sm font-medium ${patientStatus === 'cured' ? 'text-amber-700' : 'text-emerald-700'}`}
                           title={patientStatus === 'cured' ? 'Restore to active patients' : 'Mark as cured'}
                         >
                           {patientStatus === 'cured' ? <RotateCcw size={15}/> : <HeartPulse size={15}/>}
                           {patientStatus === 'cured' ? 'Restore' : 'Cure'}
+                        </button>}
+                        {role === 'admin' && <button
+                          disabled={statusUpdating}
+                          onClick={() => updateStatus(p, 'archive', { archived: !p.archived_at }, p.archived_at ? 'Restore this patient from the archive?' : 'Remove this patient from the registry? Their records and existing appointments will be kept.')}
+                          className="flex items-center gap-1 text-sm font-medium text-rose-700"
+                        >
+                          {p.archived_at ? <RotateCcw size={15}/> : <Archive size={15}/>}
+                          {p.archived_at ? 'Restore' : 'Remove'}
                         </button>}
                       </div>
                     </td>

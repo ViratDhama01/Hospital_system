@@ -81,7 +81,7 @@ class BillingSystem:
         )
         total_paid = sum(p['amount'] for p in payments_rows)
 
-        if total_paid >= total_due:
+        if round(total_due - total_paid, 2) <= 0:
             self.mark_paid(bill_id)
         else:
             db.execute("UPDATE bills SET payment_status = 'unpaid' WHERE bill_id = ?", (bill_id,))

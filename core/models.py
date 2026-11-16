@@ -14,6 +14,7 @@ class Patient:
     is_cured: int = 0
     cured_at: Optional[datetime] = None
     created_at: datetime = field(default_factory=datetime.now)
+    archived_at: Optional[datetime] = None
 
     def __str__(self):
         return f"Patient[{self.patient_id}]: {self.name} ({self.phone})"

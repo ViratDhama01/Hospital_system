@@ -3,7 +3,9 @@
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from threading import RLock
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -45,13 +47,14 @@ class Database:
     def __init__(self, database_url=None, db_path=None, retries=10, retry_delay=2):
         self.database_url = database_url if database_url is not None else os.getenv("DATABASE_URL")
         self.db_path = db_path or DB_PATH
+        self._lock = RLock()
         if self.database_url:
             self.engine = "postgres"
             self.conn = self._connect_with_retry(self.database_url, retries, retry_delay)
         else:
             self.engine = "sqlite"
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
             self.conn.row_factory = sqlite3.Row
             self.conn.execute("PRAGMA foreign_keys = ON")
 
@@ -139,12 +142,15 @@ class Database:
                 self.conn.execute("ALTER TABLE patients ADD COLUMN is_cured INTEGER NOT NULL DEFAULT 0")
             if "cured_at" not in columns:
                 self.conn.execute("ALTER TABLE patients ADD COLUMN cured_at TIMESTAMP")
+            if "archived_at" not in columns:
+                self.conn.execute("ALTER TABLE patients ADD COLUMN archived_at TIMESTAMP")
             self.conn.commit()
             return
 
         with self.conn.cursor() as cursor:
             cursor.execute("ALTER TABLE patients ADD COLUMN IF NOT EXISTS is_cured INTEGER NOT NULL DEFAULT 0")
             cursor.execute("ALTER TABLE patients ADD COLUMN IF NOT EXISTS cured_at TIMESTAMP")
+            cursor.execute("ALTER TABLE patients ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP")
 
     def _ensure_doctor_status_columns(self):
         """Add employment status to existing doctor directories without losing history."""
@@ -171,6 +177,9 @@ class Database:
             columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(users)")}
             if "display_name" not in columns:
                 self.conn.execute("ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
+            if "doctor_id" not in columns:
+                self.conn.execute("ALTER TABLE users ADD COLUMN doctor_id INTEGER REFERENCES doctors (doctor_id)")
+            self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_doctor ON users (doctor_id)")
             self.conn.execute(
                 "UPDATE users SET display_name = CASE WHEN username = 'admin' THEN 'Dr. Sharma' ELSE username END "
                 "WHERE display_name IS NULL OR display_name = ''"
@@ -180,6 +189,8 @@ class Database:
 
         with self.conn.cursor() as cursor:
             cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT NOT NULL DEFAULT ''")
+            cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS doctor_id INTEGER REFERENCES doctors (doctor_id)")
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_doctor ON users (doctor_id)")
             cursor.execute(
                 "UPDATE users SET display_name = CASE WHEN username = 'admin' THEN 'Dr. Sharma' ELSE username END "
                 "WHERE display_name IS NULL OR display_name = ''"
@@ -189,12 +200,19 @@ class Database:
     def _postgres_query(query):
         return query.replace("?", "%s")
 
+    @contextmanager
+    def write_transaction(self):
+        """Keep other requests off the shared connection until the transaction ends."""
+        with self._lock, self.conn:
+            if self.engine == "sqlite":
+                self.conn.execute("BEGIN IMMEDIATE")
+            yield
+
     def execute(self, query, params=()):
         """Execute a write and return a driver-independent result."""
         if self.engine == "sqlite":
-            cursor = self.conn.execute(query, params)
-            self.conn.commit()
-            return cursor
+            with self._lock:
+                return self.conn.execute(query, params)
 
         sql = self._postgres_query(query)
         insert_table = None
@@ -204,7 +222,7 @@ class Database:
             if id_column:
                 sql = f"{sql.rstrip().rstrip(';')} RETURNING {id_column}"
 
-        with self.conn.cursor() as cursor:
+        with self._lock, self.conn.cursor() as cursor:
             cursor.execute(sql, params)
             lastrowid = cursor.fetchone()[0] if insert_table and cursor.description else None
             return ExecutionResult(lastrowid=lastrowid, rowcount=cursor.rowcount)
@@ -212,8 +230,9 @@ class Database:
     def query(self, query, params=()):
         sql = self._postgres_query(query) if self.engine == "postgres" else query
         if self.engine == "sqlite":
-            return self.conn.execute(sql, params).fetchall()
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            with self._lock:
+                return self.conn.execute(sql, params).fetchall()
+        with self._lock, self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(sql, params)
             return cursor.fetchall()
 

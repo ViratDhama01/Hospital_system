@@ -1,30 +1,26 @@
 import React, { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
+import { homeForRole } from '../access';
 
 const Login = () => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
   const navigate = useNavigate();
 
   const handleLogin = async (e) => {
     e.preventDefault();
     setLoading(true);
+    setError('');
     try {
       const data = await api.post('/login', { username, password });
-      if (data && data.access_token) {
-        localStorage.setItem('access_token', data.access_token);
-        navigate('/dashboard');
-      } else if (data && data.user && data.access_token) {
-        // Handle case where data might be wrapped
-        localStorage.setItem('access_token', data.access_token);
-        navigate('/dashboard');
-      } else {
-        throw new Error('Login successful but no token received');
-      }
-    } catch (error) {
-      alert(error.message || 'Login failed');
+      if (!data.access_token) throw new Error('No sign-in session was returned.');
+      localStorage.setItem('access_token', data.access_token);
+      navigate(homeForRole(data.user.role), { replace: true });
+    } catch (requestError) {
+      setError(requestError.message || 'Login failed');
     } finally {
       setLoading(false);
     }
@@ -43,8 +39,10 @@ const Login = () => {
 
         <form onSubmit={handleLogin} className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Username</label>
+            <label htmlFor="login-username" className="block text-sm font-medium text-slate-700 mb-1">Username</label>
             <input
+              id="login-username"
+              autoComplete="username"
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
@@ -55,8 +53,10 @@ const Login = () => {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
+            <label htmlFor="login-password" className="block text-sm font-medium text-slate-700 mb-1">Password</label>
             <input
+              id="login-password"
+              autoComplete="current-password"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
@@ -66,6 +66,7 @@ const Login = () => {
             />
           </div>
 
+          {error && <p role="alert" className="text-sm text-rose-700">{error}</p>}
           <button
             type="submit"
             disabled={loading}
@@ -75,11 +76,7 @@ const Login = () => {
           </button>
         </form>
 
-        <div className="mt-6 text-center">
-          <p className="text-sm text-slate-500">
-            Don't have an account? <Link to="/signup" className="text-clinical-blue font-bold hover:underline">Sign up here</Link>
-          </p>
-        </div>
+        <p className="mt-6 text-center text-sm text-slate-500">Need an account? Contact your Medora administrator.</p>
       </div>
     </div>
   );

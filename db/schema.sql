@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS patients (
     blood_group TEXT,
     is_cured INTEGER NOT NULL DEFAULT 0,
     cured_at TIMESTAMP,
+    archived_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -54,8 +55,45 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
     hashed_password TEXT NOT NULL,
-    role TEXT NOT NULL, -- admin, receptionist, doctor
-    display_name TEXT NOT NULL DEFAULT ''
+    role TEXT NOT NULL, -- admin, receptionist, doctor, nurse
+    display_name TEXT NOT NULL DEFAULT '',
+    doctor_id INTEGER REFERENCES doctors (doctor_id)
+);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    session_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (user_id),
+    expires_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions (user_id);
+
+CREATE TABLE IF NOT EXISTS appointment_staff_assignments (
+    appointment_id INTEGER NOT NULL REFERENCES appointments (appointment_id),
+    role TEXT NOT NULL CHECK (role IN ('nurse', 'receptionist')),
+    user_id INTEGER NOT NULL REFERENCES users (user_id),
+    assigned_by INTEGER NOT NULL REFERENCES users (user_id),
+    assigned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (appointment_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_appointment_staff_user ON appointment_staff_assignments (user_id);
+
+CREATE TABLE IF NOT EXISTS staff_assignment_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    appointment_id INTEGER REFERENCES appointments (appointment_id),
+    user_id INTEGER NOT NULL REFERENCES users (user_id),
+    changed_by INTEGER NOT NULL REFERENCES users (user_id),
+    detail TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS patient_status_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_id INTEGER NOT NULL REFERENCES patients (patient_id),
+    changed_by INTEGER NOT NULL REFERENCES users (user_id),
+    action TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Health Records Table

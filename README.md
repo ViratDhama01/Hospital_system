@@ -5,6 +5,16 @@
 4. **Billing & insurance** — consultation fees, tests, packages, insurance claims
 5. **Admin/reporting** — occupancy, daily footfall, doctor load, revenue
 
+## Medora for macOS
+
+On an Apple Silicon Mac with Docker Desktop installed, open the Medora DMG, drag **Medora** into **Applications**, and open it. Medora starts Docker Desktop when needed and runs the bundled React app, FastAPI server, and PostgreSQL database. The first launch imports the images locally. Sign in to a new installation with `admin` / `admin123`.
+
+Medora has a separate database from the repository's development stack. It keeps its data across launches and stops its containers when you quit the app.
+
+To upgrade, quit the open copy, replace it in Applications, and sign in again if prompted. The new app uses the same database volume. Administrators can create logins and edit roles under **Staff Assignments → Accounts & roles**. Register a doctor under **Doctors** before linking their login. Use **Appointment assignments** to assign a nurse or receptionist to a booked visit. Staff can find their assigned visits with **My assignments** on the Appointments page.
+
+To rebuild the installer from this checkout, start Docker Desktop and run `bash packaging/macos/build-dmg.sh`. The versioned installer is written to `dist/`.
+
 ## 2. Architecture
 
 | Stage | What you build | Tech |

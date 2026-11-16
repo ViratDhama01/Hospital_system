@@ -1,11 +1,15 @@
 import React, { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Activity, FileText, Pill, User, Save, Plus, X } from 'lucide-react';
+import { Link, useParams, useNavigate, useOutletContext } from 'react-router-dom';
+import { ArrowLeft, Activity, User, Save, Plus, X } from 'lucide-react';
 import { api } from '../api';
+import { isClinician } from '../access';
+import PrescriptionResults from '../components/PrescriptionResults';
 
 const PatientProfile = () => {
   const { id } = useParams();
   const navigate = useNavigate();
+  const { role, doctor_id: linkedDoctor } = useOutletContext();
+  const clinical = isClinician(role);
   const [patient, setPatient] = useState(null);
   const [loading, setLoading] = useState(true);
   const [isEditing, setIsEditing] = useState(false);
@@ -24,8 +28,8 @@ const PatientProfile = () => {
 
   useEffect(() => {
     fetchPatient();
-    fetchClinicalData();
-  }, [id]);
+    if (clinical) fetchClinicalData();
+  }, [id, clinical]);
 
   const fetchPatient = async () => {
     try {
@@ -50,7 +54,7 @@ const PatientProfile = () => {
       setClinicalNotes(notes);
       setPrescriptions(pres);
       setLabs(labResults);
-      setDoctors(doctorData);
+      setDoctors(linkedDoctor ? doctorData.filter((doctor) => doctor.doctor_id === linkedDoctor) : doctorData);
     } catch (error) {
       console.error('Failed to fetch clinical data:', error);
     }
@@ -125,12 +129,12 @@ const PatientProfile = () => {
             <p className="text-slate-500">Patient ID: {patient.patient_id}</p>
           </div>
         </div>
-        <button
+        {!patient.archived_at && <button
           onClick={() => isEditing ? handleSave() : setIsEditing(true)}
           className={`px-4 py-2 rounded-lg font-medium transition-colors ${isEditing ? 'bg-emerald-500 text-white' : 'bg-clinical-blue text-white'}`}
         >
           {isEditing ? 'Save Changes' : 'Edit Profile'}
-        </button>
+        </button>}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -188,18 +192,18 @@ const PatientProfile = () => {
           </div>
         </div>
 
-        <div className="lg:col-span-2 space-y-6">
+        {clinical ? <div className="lg:col-span-2 space-y-6">
           <div className="card">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-bold flex items-center gap-2">
                 <Activity size={20} className="text-clinical-blue"/> Clinical Summary (EHR)
               </h2>
-              <button
+              {!patient.archived_at && <button
                 onClick={() => setShowAddNote(true)}
                 className="btn-primary py-1 px-3 text-xs flex items-center gap-1"
               >
                 <Plus size={14}/> Add Record
-              </button>
+              </button>}
             </div>
             <div className="space-y-3">
               {clinicalNotes.length === 0 ? (
@@ -273,58 +277,12 @@ const PatientProfile = () => {
             </div>
           )}
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div className="card">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-lg font-bold flex items-center gap-2">
-                  <Pill size={20} className="text-clinical-blue"/> Active Prescriptions
-                </h2>
-                <button onClick={() => setShowAddPrescription(true)} className="btn-primary py-1 px-3 text-xs flex items-center gap-1">
-                  <Plus size={14}/> Add
-                </button>
-              </div>
-              <div className="space-y-3">
-                {prescriptions.length === 0 ? (
-                  <p className="text-sm text-slate-500">No active prescriptions.</p>
-                ) : (
-                  prescriptions.map((p, i) => (
-                    <div key={i} className="p-3 bg-slate-50 rounded-xl border border-slate-100">
-                      <div className="flex justify-between items-center mb-1">
-                        <span className="font-medium text-clinical-dark">{p.medication}</span>
-                        <span className="text-[10px] text-slate-500">{new Date(p.date_issued).toLocaleDateString()}</span>
-                      </div>
-                      <p className="text-xs text-slate-600">{p.dosage} • {p.frequency} • {p.duration}</p>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-            <div className="card">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-lg font-bold flex items-center gap-2">
-                  <FileText size={20} className="text-clinical-blue"/> Recent Lab Results
-                </h2>
-                <button onClick={() => setShowAddLab(true)} className="btn-primary py-1 px-3 text-xs flex items-center gap-1">
-                  <Plus size={14}/> Add
-                </button>
-              </div>
-              <div className="space-y-3">
-                {labs.length === 0 ? (
-                  <p className="text-sm text-slate-500">No laboratory results found.</p>
-                ) : (
-                  labs.map((l, i) => (
-                    <div key={i} className="p-3 bg-slate-50 rounded-xl border border-slate-100">
-                      <div className="flex justify-between items-center mb-1">
-                        <span className="font-medium text-clinical-dark">{l.test_name}</span>
-                        <span className="text-[10px] text-slate-500">{new Date(l.date_performed).toLocaleDateString()}</span>
-                      </div>
-                      <p className="text-xs text-slate-600">{l.result_value} {l.unit} • <span className="font-bold">{l.status}</span></p>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          </div>
+          <PrescriptionResults
+            prescriptions={prescriptions}
+            labs={labs}
+            onAddPrescription={patient.archived_at ? undefined : () => setShowAddPrescription(true)}
+            onAddLab={patient.archived_at ? undefined : () => setShowAddLab(true)}
+          />
 
           {(showAddPrescription || showAddLab) && (
             <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
@@ -379,7 +337,11 @@ const PatientProfile = () => {
               </div>
             </div>
           )}
-        </div>
+        </div> : (
+          <div className="card lg:col-span-2">
+            <Link className="font-medium text-clinical-blue hover:underline" to={`/ehr/${id}`}>View prescriptions and lab results</Link>
+          </div>
+        )}
       </div>
     </div>
   );

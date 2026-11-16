@@ -35,9 +35,13 @@ class Scheduler:
             parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
             return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
 
-        # Atomic booking block to prevent double-booking race conditions
-        db.execute("BEGIN IMMEDIATE")
-        try:
+        with db.write_transaction():
+            if db.engine == "postgres":
+                # Serialize bookings for this doctor even when no appointments exist yet.
+                db.query_one(
+                    "SELECT doctor_id FROM doctors WHERE doctor_id = ? FOR NO KEY UPDATE",
+                    (doctor.doctor_id,),
+                )
             rows = db.query(
                 "SELECT start_time, end_time FROM appointments "
                 "WHERE doctor_id = ? AND status = 'booked'",
@@ -96,7 +100,6 @@ class Scheduler:
             """
             cursor = db.execute(query, (patient.patient_id, doctor.doctor_id, start_time.isoformat(), end_time.isoformat(), priority, category))
             appointment_id = cursor.lastrowid
-            db.execute("COMMIT")
 
             return Appointment(
                 appointment_id=appointment_id,
@@ -107,10 +110,6 @@ class Scheduler:
                 priority=priority,
                 category=category,
             )
-        except Exception:
-            db.execute("ROLLBACK")
-            raise
-
     def cancel_appointment(self, appointment_id: int) -> bool:
         """Cancels an appointment by ID."""
         query = "UPDATE appointments SET status = 'cancelled' WHERE appointment_id = ?"

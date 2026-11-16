@@ -68,7 +68,7 @@ class PatientRegistry:
 
     def update_patient(self, patient_id: int, **kwargs) -> bool:
         patient = self.get_by_id(patient_id)
-        if not patient:
+        if not patient or patient.archived_at:
             return False
 
         editable_fields = {"name", "dob", "gender", "phone", "address", "blood_group"}
@@ -85,38 +85,59 @@ class PatientRegistry:
 
         fields = [f"{field} = ?" for field in updates]
         values = [*updates.values(), patient_id]
-        db.execute(f"UPDATE patients SET {', '.join(fields)} WHERE patient_id = ?", tuple(values))
+        result = db.execute(f"UPDATE patients SET {', '.join(fields)} WHERE patient_id = ? AND archived_at IS NULL", tuple(values))
+        if not result.rowcount:
+            return False
         self._cache_patient(replace(patient, **updates))
         return True
 
     def list_all_patients(self, status: str = "active") -> List[Patient]:
-        """List active, cured, or all patients and refresh the ID/phone hash maps."""
+        """List patients for the selected registry view and refresh the hash maps."""
         if status == "active":
-            rows = db.query("SELECT * FROM patients WHERE is_cured = 0 ORDER BY patient_id DESC")
+            rows = db.query("SELECT * FROM patients WHERE is_cured = 0 AND archived_at IS NULL ORDER BY patient_id DESC")
         elif status == "cured":
-            rows = db.query("SELECT * FROM patients WHERE is_cured = 1 ORDER BY cured_at DESC")
+            rows = db.query("SELECT * FROM patients WHERE is_cured = 1 AND archived_at IS NULL ORDER BY cured_at DESC")
         elif status == "all":
-            rows = db.query("SELECT * FROM patients ORDER BY patient_id DESC")
+            rows = db.query("SELECT * FROM patients WHERE archived_at IS NULL ORDER BY patient_id DESC")
+        elif status == "archived":
+            rows = db.query("SELECT * FROM patients WHERE archived_at IS NOT NULL ORDER BY archived_at DESC")
         else:
-            raise ValueError("status must be 'active', 'cured', or 'all'")
+            raise ValueError("Unknown patient registry status")
         return [self._cache_patient(self._patient_from_row(row)) for row in rows]
 
-    def set_cured(self, patient_id: int, cured: bool) -> bool:
+    def set_cured(self, patient_id: int, cured: bool, changed_by: int) -> Optional[Patient]:
         """Move a patient between the active registry and cured history."""
-        if cured:
+        timestamp = "CURRENT_TIMESTAMP" if cured else "NULL"
+        with db.write_transaction():
             result = db.execute(
-                "UPDATE patients SET is_cured = 1, cured_at = CURRENT_TIMESTAMP WHERE patient_id = ?",
+                f"UPDATE patients SET is_cured = ?, cured_at = {timestamp} "
+                "WHERE patient_id = ? AND archived_at IS NULL AND is_cured <> ?",
+                (int(cured), patient_id, int(cured)),
+            )
+            if result.rowcount:
+                self._log_status_change(patient_id, changed_by, "cured" if cured else "reactivated")
+            row = db.query_one("SELECT * FROM patients WHERE patient_id = ? AND archived_at IS NULL", (patient_id,))
+        return self._cache_patient(self._patient_from_row(row)) if row else None
+
+    def set_archived(self, patient_id: int, archived: bool, changed_by: int) -> Optional[Patient]:
+        """Remove a patient from the working registry or restore their original status."""
+        timestamp = "CURRENT_TIMESTAMP" if archived else "NULL"
+        condition = "IS NULL" if archived else "IS NOT NULL"
+        with db.write_transaction():
+            result = db.execute(
+                f"UPDATE patients SET archived_at = {timestamp} WHERE patient_id = ? AND archived_at {condition}",
                 (patient_id,),
             )
-        else:
-            result = db.execute(
-                "UPDATE patients SET is_cured = 0, cured_at = NULL WHERE patient_id = ?",
-                (patient_id,),
-            )
-        if result.rowcount == 0:
-            return False
-        self._patients_by_id.pop(patient_id, None)
-        row = db.query_one("SELECT * FROM patients WHERE patient_id = ?", (patient_id,))
-        if row:
-            self._cache_patient(self._patient_from_row(row))
-        return True
+            if result.rowcount:
+                self._log_status_change(patient_id, changed_by, "archived" if archived else "unarchived")
+                if archived:
+                    db.execute("DELETE FROM walk_in_queue WHERE patient_id = ?", (patient_id,))
+            row = db.query_one("SELECT * FROM patients WHERE patient_id = ?", (patient_id,))
+        return self._cache_patient(self._patient_from_row(row)) if row else None
+
+    @staticmethod
+    def _log_status_change(patient_id: int, changed_by: int, action: str):
+        db.execute(
+            "INSERT INTO patient_status_events (patient_id, changed_by, action) VALUES (?, ?, ?)",
+            (patient_id, changed_by, action),
+        )

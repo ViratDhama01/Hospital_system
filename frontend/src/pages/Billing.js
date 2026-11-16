@@ -2,15 +2,19 @@ import React, { useState, useEffect } from 'react';
 import { CreditCard, Receipt, CheckCircle, History, X } from 'lucide-react';
 import { api } from '../api';
 
+const emptyPayment = { bill_id: '', amount: '', method: 'Cash' };
+
 const Billing = () => {
   const [bills, setBills] = useState([]);
   const [appointments, setAppointments] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showGenModal, setShowGenModal] = useState(false);
   const [genData, setGenData] = useState({ appointment_id: '' });
-  const [payData, setPayData] = useState({ bill_id: '', amount: '', method: 'Credit Card' });
+  const [payData, setPayData] = useState(emptyPayment);
   const [paymentProcessing, setPaymentProcessing] = useState(false);
   const [paymentError, setPaymentError] = useState('');
+  const [paymentNotice, setPaymentNotice] = useState('');
+  const [invoiceError, setInvoiceError] = useState('');
   const [statusUpdatingId, setStatusUpdatingId] = useState(null);
 
   useEffect(() => {
@@ -60,24 +64,26 @@ const Billing = () => {
       amount: selected ? String(selected.remaining_amount ?? selected.amount) : ''
     });
     setPaymentError('');
+    setPaymentNotice('');
   };
 
   const handlePayment = async (event) => {
     event.preventDefault();
     setPaymentProcessing(true);
     setPaymentError('');
+    setPaymentNotice('');
     try {
       const result = await api.post('/billing/pay', {
         bill_id: parseInt(payData.bill_id),
         amount: parseFloat(payData.amount),
         method: payData.method
       });
-      alert(result.payment_status === 'processing'
-        ? 'Payment saved as In Process. The invoice will remain unpaid until the payment is confirmed.'
+      setPaymentNotice(result.payment_status === 'processing'
+        ? 'Pending payment recorded. Confirm it from the invoice after verifying receipt.'
         : result.invoice_status === 'paid'
           ? 'Cash payment recorded. Invoice is fully paid.'
           : 'Cash payment recorded. A balance remains on this invoice.');
-      setPayData({ bill_id: '', amount: '', method: 'Credit Card' });
+      setPayData(emptyPayment);
       await fetchBills();
     } catch (error) {
       setPaymentError(error.message || 'Payment failed. Check the invoice and try again.');
@@ -86,15 +92,20 @@ const Billing = () => {
     }
   };
 
-  const updatePaymentStatus = async (bill) => {
-    const nextStatus = bill.payment_status === 'paid' ? 'unpaid' : 'paid';
-    if (!window.confirm(`Manually mark invoice #${bill.bill_id} as ${nextStatus}?`)) return;
+  const updatePaymentStatus = async (bill, nextStatus) => {
+    const pending = bill.payment_status === 'processing';
+    const label = `invoice #${bill.bill_id}`;
+    const question = nextStatus === 'unpaid'
+      ? `Cancel the pending payment on ${label}?`
+      : pending ? `Confirm receipt of the pending payment on ${label}?` : `Record the remaining balance on ${label} as received?`;
+    if (!window.confirm(question)) return;
     setStatusUpdatingId(bill.bill_id);
+    setInvoiceError('');
     try {
-      await api.patch(`/billing/${bill.bill_id}/status`, { payment_status: nextStatus });
+      await api.patch(`/billing/${bill.bill_id}/status`, { payment_status: nextStatus, confirm_pending: pending });
       await fetchBills();
     } catch (error) {
-      alert(error.message || 'Unable to update invoice status');
+      setInvoiceError(error.message || 'Unable to update invoice status');
     } finally {
       setStatusUpdatingId(null);
     }
@@ -155,7 +166,7 @@ const Billing = () => {
       <section id="payment-portal" className="card border border-blue-100">
         <div className="mb-5 flex items-start gap-3">
           <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-blue-100 text-clinical-blue"><CreditCard size={22}/></div>
-          <div><h2 className="text-lg font-bold">Process Payment</h2><p className="text-sm text-slate-500">Choose an unpaid invoice, enter the amount received, and select the payment method.</p></div>
+          <div><h2 className="text-lg font-bold">Record Payment</h2><p className="text-sm text-slate-500">Cash is recorded immediately. Confirm card or UPI payments after verifying receipt.</p></div>
         </div>
         <form onSubmit={handlePayment} className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4 xl:items-end">
           <label className="block text-xs font-bold uppercase text-slate-500">Invoice
@@ -173,16 +184,18 @@ const Billing = () => {
             </select>
           </label>
           <button type="submit" disabled={paymentProcessing || !outstandingBills.length} className="btn-primary flex min-h-10 items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-50">
-            <CreditCard size={17}/>{paymentProcessing ? 'Processing…' : 'Process Payment'}
+            <CreditCard size={17}/>{paymentProcessing ? 'Recording…' : 'Record Payment'}
           </button>
         </form>
         {outstandingBills.length === 0 && <p className="mt-3 text-sm text-slate-500">There are no outstanding invoices to process.</p>}
         {paymentError && <p role="alert" className="mt-3 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{paymentError}</p>}
+        {paymentNotice && <p role="status" className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700">{paymentNotice}</p>}
       </section>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         <div className="lg:col-span-2 card">
           <h2 className="text-lg font-bold mb-4">Recent Invoices</h2>
+          {invoiceError && <p role="alert" className="mb-3 text-sm text-rose-700">{invoiceError}</p>}
           <div className="overflow-x-auto">
             <table className="w-full text-left">
               <thead className="bg-slate-50 text-slate-500 text-xs uppercase tracking-wider">
@@ -214,10 +227,11 @@ const Billing = () => {
                       <td className="px-6 py-4 text-sm text-slate-500">{new Date(bill.bill_date).toLocaleDateString()}</td>
                       <td className="px-6 py-4">
                         <div className="flex flex-wrap items-center gap-3">
-                          {bill.payment_status === 'unpaid' && <button onClick={() => { selectBillForPayment(bill.bill_id); document.getElementById('payment-portal')?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }} className="text-clinical-blue hover:underline text-sm font-medium">Pay Now</button>}
-                          <button disabled={statusUpdatingId === bill.bill_id} onClick={() => updatePaymentStatus(bill)} className="text-xs font-semibold text-slate-600 hover:underline disabled:opacity-50">
-                            {statusUpdatingId === bill.bill_id ? 'Updating…' : bill.payment_status === 'paid' ? 'Mark Unpaid' : 'Mark Paid'}
-                          </button>
+                          {bill.payment_status === 'unpaid' && <button onClick={() => { selectBillForPayment(bill.bill_id); document.getElementById('payment-portal')?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }} className="text-clinical-blue hover:underline text-sm font-medium">Record Payment</button>}
+                          {bill.payment_status !== 'paid' && <button disabled={statusUpdatingId === bill.bill_id} onClick={() => updatePaymentStatus(bill, 'paid')} className="text-xs font-semibold text-slate-600 hover:underline disabled:opacity-50">
+                            {statusUpdatingId === bill.bill_id ? 'Updating…' : bill.payment_status === 'processing' ? 'Confirm Payment' : 'Mark Paid'}
+                          </button>}
+                          {bill.payment_status === 'processing' && <button disabled={statusUpdatingId === bill.bill_id} onClick={() => updatePaymentStatus(bill, 'unpaid')} className="text-xs font-semibold text-rose-700 hover:underline disabled:opacity-50">Cancel Pending</button>}
                         </div>
                       </td>
                     </tr>

@@ -1,9 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, Navigate, Outlet, useNavigate } from 'react-router-dom';
 import {
   LayoutDashboard,
   Users,
   UserRound,
+  UserPlus,
   CalendarDays,
   FileText,
   CreditCard,
@@ -16,8 +17,9 @@ import {
   LogOut as SwitchAccountIcon,
 } from 'lucide-react';
 import { api } from '../api';
+import { canReadStaffRecords, canRunOperations, isClinician, roleLabel } from '../access';
 
-const Layout = ({ children }) => {
+const Layout = () => {
   const navigate = useNavigate();
   const [searchTerm, setSearchTerm] = useState('');
   const [searchResults, setSearchResults] = useState({ patients: [], doctors: [] });
@@ -25,6 +27,8 @@ const Layout = ({ children }) => {
   const [searchOpen, setSearchOpen] = useState(false);
   const searchRef = useRef(null);
   const [profile, setProfile] = useState(null);
+  const [profileError, setProfileError] = useState('');
+  const [signingOut, setSigningOut] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [profileModalOpen, setProfileModalOpen] = useState(false);
   const [profileSaving, setProfileSaving] = useState(false);
@@ -37,12 +41,13 @@ const Layout = ({ children }) => {
   }, []);
 
   useEffect(() => {
+    if (!localStorage.getItem('access_token')) return;
     api.get('/auth/profile')
       .then((data) => {
         setProfile(data);
         setProfileForm({ username: data.username, display_name: data.display_name || data.username, current_password: '', new_password: '' });
       })
-      .catch((error) => console.error('Unable to load account profile:', error));
+      .catch((error) => setProfileError(error.message || 'Unable to load your account.'));
   }, []);
 
   useEffect(() => {
@@ -73,7 +78,8 @@ const Layout = ({ children }) => {
   }, [searchTerm]);
 
   const openResult = (type, id) => {
-    navigate(type === 'patient' ? `/patients/${id}` : `/doctors/${id}`);
+    if (type === 'patient') navigate(`/patients/${id}`);
+    else if (isClinician(profile?.role)) navigate(`/doctors/${id}`);
     setSearchTerm('');
     setSearchOpen(false);
   };
@@ -83,7 +89,7 @@ const Layout = ({ children }) => {
       type: 'patient', id: patient.patient_id, title: patient.name,
       detail: `Patient #${patient.patient_id} · ${patient.phone}`
     })),
-    ...(searchResults.doctors || []).map((doctor) => ({
+    ...(isClinician(profile?.role) ? searchResults.doctors || [] : []).map((doctor) => ({
       type: 'doctor', id: doctor.doctor_id, title: `Dr. ${doctor.name}`,
       detail: `${doctor.specialization} · ${doctor.department}`
     }))
@@ -127,23 +133,35 @@ const Layout = ({ children }) => {
     }
   };
 
-  const switchAccount = () => {
-    localStorage.removeItem('access_token');
-    setAccountMenuOpen(false);
-    navigate('/');
+  const switchAccount = async () => {
+    setSigningOut(true);
+    try {
+      await api.post('/logout');
+    } catch (error) {
+      console.error('Could not end the server session:', error);
+    } finally {
+      localStorage.removeItem('access_token');
+      setAccountMenuOpen(false);
+      navigate('/', { replace: true });
+    }
   };
 
-  const roleLabel = (role) => ({ admin: 'Chief Administrator', doctor: 'Doctor', receptionist: 'Receptionist' }[role] || role || '');
+  if (!localStorage.getItem('access_token')) return <Navigate to="/" replace/>;
+  if (!profile) return <div className="p-8" role={profileError ? 'alert' : 'status'}>
+    {profileError || 'Loading account…'}
+    {profileError && <button className="ml-4 btn-primary" onClick={() => window.location.reload()}>Retry</button>}
+  </div>;
 
   const menuItems = [
-    { name: 'Dashboard', icon: <LayoutDashboard size={20}/>, path: '/dashboard' },
-    { name: 'Patients', icon: <Users size={20}/>, path: '/patients' },
-    { name: 'Doctors', icon: <UserRound size={20}/>, path: '/doctors' },
-    { name: 'Appointments', icon: <CalendarDays size={20}/>, path: '/appointments' },
-    { name: 'Reports', icon: <BarChart3 size={20}/>, path: '/reports' },
-    { name: 'Billing', icon: <CreditCard size={20}/>, path: '/billing' },
-    { name: 'EHR', icon: <FileText size={20}/>, path: '/ehr' },
-    { name: 'History', icon: <HistoryIcon size={20}/>, path: '/history' },
+    { name: 'Dashboard', icon: <LayoutDashboard size={20}/>, path: '/dashboard', allowed: isClinician },
+    { name: 'Patients', icon: <Users size={20}/>, path: '/patients', allowed: canRunOperations },
+    { name: 'Doctors', icon: <UserRound size={20}/>, path: '/doctors', allowed: isClinician },
+    { name: 'Appointments', icon: <CalendarDays size={20}/>, path: '/appointments', allowed: canReadStaffRecords },
+    { name: 'Staff Assignments', icon: <UserPlus size={20}/>, path: '/staff', allowed: (role) => role === 'admin' },
+    { name: 'Reports', icon: <BarChart3 size={20}/>, path: '/reports', allowed: isClinician },
+    { name: 'Billing', icon: <CreditCard size={20}/>, path: '/billing', allowed: canRunOperations },
+    { name: isClinician(profile.role) ? 'EHR' : 'Prescriptions & labs', icon: <FileText size={20}/>, path: '/ehr', allowed: canReadStaffRecords },
+    { name: 'History', icon: <HistoryIcon size={20}/>, path: '/history', allowed: isClinician },
   ];
 
   return (
@@ -155,8 +173,8 @@ const Layout = ({ children }) => {
           <span className="text-xl font-bold text-clinical-dark tracking-tight">Medora</span>
         </div>
 
-        <nav className="flex-1 px-4 space-y-1">
-          {menuItems.map((item) => (
+        <nav className="flex-1 overflow-y-auto px-4 space-y-1">
+          {menuItems.filter((item) => item.allowed(profile.role)).map((item) => (
             <Link
               key={item.name}
               to={item.path}
@@ -169,9 +187,9 @@ const Layout = ({ children }) => {
         </nav>
 
         <div className="p-4 border-t border-slate-100">
-          <button className="flex items-center gap-3 px-3 py-2 w-full text-slate-600 hover:bg-red-50 hover:text-red-600 rounded-xl transition-all group">
+          <button onClick={switchAccount} disabled={signingOut} className="flex items-center gap-3 px-3 py-2 w-full text-slate-600 hover:bg-red-50 hover:text-red-600 rounded-xl transition-all group">
             <LogOut size={20} className="text-slate-400 group-hover:text-red-600"/>
-            <span className="font-medium">Logout</span>
+            <span className="font-medium">{signingOut ? 'Signing out…' : 'Logout'}</span>
           </button>
         </div>
       </aside>
@@ -180,13 +198,13 @@ const Layout = ({ children }) => {
       <main className="flex-1 flex flex-col overflow-hidden">
         {/* Header */}
         <header className="h-16 bg-white border-b border-slate-200 px-8 flex items-center justify-between">
-          <div className="relative w-96" ref={searchRef}>
+          {canRunOperations(profile.role) ? <div className="relative w-96" ref={searchRef}>
             <input
               type="text"
               role="combobox"
               aria-expanded={searchOpen && searchTerm.trim().length >= 2}
               aria-controls="global-search-results"
-              placeholder="Search patients, doctors..."
+              placeholder={isClinician(profile.role) ? 'Search patients, doctors...' : 'Search patients...'}
               className="w-full pl-10 pr-10 py-2 bg-slate-100 border-none rounded-full text-sm focus:ring-2 focus:ring-clinical-blue transition-all"
               value={searchTerm}
               onChange={(event) => { setSearchTerm(event.target.value); setSearchOpen(true); }}
@@ -222,7 +240,7 @@ const Layout = ({ children }) => {
                 )}
               </div>
             )}
-          </div>
+          </div> : <div/>}
 
           <time
             dateTime={localClock.toISOString()}
@@ -253,7 +271,7 @@ const Layout = ({ children }) => {
                 <button onClick={openProfileEditor} className="w-full px-4 py-2.5 text-left text-sm text-slate-700 hover:bg-blue-50 flex items-center gap-2">
                   <UserRound size={16}/> Edit profile
                 </button>
-                <button onClick={switchAccount} className="w-full px-4 py-2.5 text-left text-sm text-slate-700 hover:bg-red-50 flex items-center gap-2">
+                <button onClick={switchAccount} disabled={signingOut} className="w-full px-4 py-2.5 text-left text-sm text-slate-700 hover:bg-red-50 flex items-center gap-2">
                   <SwitchAccountIcon size={16}/> Switch account
                 </button>
               </div>
@@ -296,7 +314,7 @@ const Layout = ({ children }) => {
 
         {/* Page Content */}
         <div className="flex-1 overflow-y-auto p-8">
-          {children}
+          <Outlet context={profile}/>
         </div>
       </main>
     </div>
